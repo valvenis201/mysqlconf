@@ -1,0 +1,16 @@
+20240526 10:30:15,localhost.localdomain,root,localhost,1,0,CONNECT,,,0
+20240526 10:30:16,localhost.localdomain,root,localhost,1,1,QUERY,mysql,'SELECT @@version',0
+20240526 10:30:17,localhost.localdomain,root,localhost,1,2,QUERY,information_schema,'SELECT * FROM tables',0
+20240526 10:31:00,localhost.localdomain,user1,192.168.1.100,2,0,CONNECT,,,0
+20240526 10:31:01,localhost.localdomain,user1,192.168.1.100,2,3,QUERY,testdb,'SELECT * FROM users',0
+20240526 10:31:15,localhost.localdomain,user2,192.168.1.101,3,0,FAILED_CONNECT,,,1045
+20240526 10:32:00,localhost.localdomain,user1,192.168.1.100,2,4,QUERY,testdb,'INSERT INTO logs VALUES (1, "test")',0
+20240526 10:32:30,localhost.localdomain,admin,192.168.1.50,4,0,CONNECT,,,0
+20240526 10:32:31,localhost.localdomain,admin,192.168.1.50,4,5,QUERY,mysql,'DROP TABLE test',1146
+20240526 10:33:00,localhost.localdomain,user3,192.168.1.102,5,0,FAILED_CONNECT,,,1045
+20240526 11:00:00,localhost.localdomain,root,localhost,1,6,QUERY,mysql,'SHOW PROCESSLIST',0
+20240526 11:15:30,localhost.localdomain,user1,192.168.1.100,2,7,QUERY,testdb,'UPDATE users SET status=1',0
+20240526 11:30:45,localhost.localdomain,backup,192.168.1.200,6,0,CONNECT,,,0
+20240526 11:30:46,localhost.localdomain,backup,192.168.1.200,6,8,QUERY,testdb,'SELECT * FROM users FOR BACKUP',0
+20240526 12:00:00,localhost.localdomain,user2,192.168.1.101,7,0,CONNECT,,,0
+20240526 12:00:01,localhost.localdomain,user2,192.168.1.101,7,9,QUERY,testdb,'DELETE FROM temp_table',0
