@@ -1,583 +1,820 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MySQL 審計日誌 PDF 報表生成器
-每日自動分析 MySQL 審計日誌並生成 PDF 報表
-
-版本: 1.0.0
-日期: 2024-05-27
+MySQL Audit Log Security Analyzer (with Privileged Account Login Analysis)
 """
 
+import csv
 import os
-import re
-import logging
 import sys
+import argparse
 from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 from pathlib import Path
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from dotenv import load_dotenv
+import re
+from typing import Dict, List, Tuple, Optional
+import json
+import smtplib
+from email.message import EmailMessage
+from email.utils import formataddr
 
+# Try to import optional dependencies
+try:
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.lib import colors
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
-class ConfigManager:
-    """配置管理器，支援 .env 檔案和環境變數"""
-    
-    def __init__(self, env_file=".env"):
-        self.env_file = env_file
-        self.config = {}
+try:
+    from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
+except ImportError:
+    DOTENV_AVAILABLE = False
+
+class Config:
+    """Configuration management class"""
+    def __init__(self, env_file=None):
+        self.env_file = env_file or '.env'
         self.load_config()
     
     def load_config(self):
-        """載入配置"""
-        # 1. 載入 .env 檔案 (如果存在且有 dotenv)
-        load_dotenv(self.env_file)
+        """Load configuration"""
+        # Load environment variables file
+        if DOTENV_AVAILABLE and os.path.exists(self.env_file):
+            load_dotenv(self.env_file)
+        
+        # Basic configuration
+        self.company_name = os.getenv('COMPANY_NAME', 'Your Company')
+        self.report_title = os.getenv('REPORT_TITLE', 'MySQL Audit Log Security Analysis Report')
+        
+        # Log file configuration
+        self.log_base_path = os.getenv('LOG_BASE_PATH', '/var/log/mysql/audit')
+        self.log_file_prefix = os.getenv('LOG_FILE_PREFIX', 'server_audit.log')
+        self.output_dir = os.getenv('OUTPUT_DIR', '/tmp/mysql_reports')
+        
+        # Security thresholds
+        self.failed_login_threshold = int(os.getenv('FAILED_LOGIN_THRESHOLD', '5'))
+        self.suspicious_ips = os.getenv('SUSPICIOUS_IPS', '').split(',') if os.getenv('SUSPICIOUS_IPS') else []
+        
+        # Report configuration
+        self.include_detailed_logs = os.getenv('INCLUDE_DETAILED_LOGS', 'true').lower() == 'true'
+        self.max_events_in_report = int(os.getenv('MAX_EVENTS_IN_REPORT', '1000'))
 
-        
-        # 2. 設定預設值並從環境變數讀取
-        defaults = {
-            'LOG_DIR': '/var/log/mysql/audit',
-            'OUTPUT_DIR': '/tmp/mysql_reports',
-            'LOG_LEVEL': 'INFO',
-            'LOG_FILE': '/var/log/mysql/audit/mysql_audit_analyzer.log',
-            'PDF_FONT_SIZE': '10',
-            'PDF_TITLE_FONT_SIZE': '18',
-            'PDF_HEADING_FONT_SIZE': '14',
-            'MAX_ERROR_EVENTS': '50',
-            'MAX_FAILED_LOGINS': '50',
-            'TOP_USERS_COUNT': '10',
-            'TOP_OPERATIONS_COUNT': '10',
-            'CUSTOM_FONT_PATH': '',
-            'DATE_FORMAT': '%Y-%m-%d',
-            'TIMESTAMP_FORMAT': '%Y%m%d %H:%M:%S',
-            'LOG_DELIMITER': ',',
-            'MIN_LOG_FIELDS': '8',
-            'REPORT_TITLE': 'MySQL Audit ReportV1',
-            'COMPANY_NAME': ''
-        }
-        
-        for key, default_value in defaults.items():
-            self.config[key] = os.getenv(key, default_value)
-        
-        # 3. 類型轉換
-        self._convert_types()
+        # After-hours access config
+        self.after_hours_users = os.getenv('AFTER_HOURS_USERS', '').split(',') if os.getenv('AFTER_HOURS_USERS') else []
+        self.work_hour_start = int(os.getenv('WORK_HOUR_START', '9'))  # 09:00
+        self.work_hour_end = int(os.getenv('WORK_HOUR_END', '18'))    # 18:00
+
+        # Privileged users config
+        self.privileged_users = os.getenv('PRIVILEGED_USERS', '').split(',') if os.getenv('PRIVILEGED_USERS') else []
+
+        # Email settings
+        self.smtp_host = os.getenv('SMTP_HOST', '')
+        self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        self.smtp_user = os.getenv('SMTP_USER', '')
+        self.smtp_password = os.getenv('SMTP_PASSWORD', '')
+        self.mail_from = os.getenv('MAIL_FROM', self.smtp_user)
+        self.mail_to = os.getenv('MAIL_TO', '').split(',') if os.getenv('MAIL_TO') else []
+        self.mail_subject = os.getenv('MAIL_SUBJECT', self.report_title)
+
+        # Report output control
+        self.generate_pdf = os.getenv('GENERATE_PDF', 'true').lower() == 'true'
+        self.generate_csv = os.getenv('GENERATE_CSV', 'true').lower() == 'true'
+
+        # Email send control
+        self.send_email = os.getenv('SEND_EMAIL', 'false').lower() == 'true'
     
-    def _convert_types(self):
-        """轉換配置值的類型"""
-        int_keys = [
-            'PDF_FONT_SIZE', 'PDF_TITLE_FONT_SIZE', 'PDF_HEADING_FONT_SIZE',
-            'MAX_ERROR_EVENTS', 'MAX_FAILED_LOGINS', 'TOP_USERS_COUNT',
-            'TOP_OPERATIONS_COUNT', 'MIN_LOG_FIELDS'
+    def get_log_file_path(self, date_str: str = None) -> str:
+        """Get log file path"""
+        if date_str is None:
+            # Current day's log file
+            return os.path.join(self.log_base_path, self.log_file_prefix)
+        else:
+            # Historical log file
+            return os.path.join(self.log_base_path, f"{self.log_file_prefix}-{date_str}")
+    
+    def show_config(self):
+        """Display current configuration"""
+        print("=== MySQL Audit Log Analyzer Configuration ===")
+        print(f"Company Name: {self.company_name}")
+        print(f"Report Title: {self.report_title}")
+        print(f"Log Base Path: {self.log_base_path}")
+        print(f"Log File Prefix: {self.log_file_prefix}")
+        print(f"Output Directory: {self.output_dir}")
+        print(f"Failed Login Threshold: {self.failed_login_threshold}")
+        print(f"Suspicious IP List: {self.suspicious_ips}")
+        print(f"Include Detailed Logs: {self.include_detailed_logs}")
+        print(f"Max Events in Report: {self.max_events_in_report}")
+        print(f"After-hours Users: {self.after_hours_users}")
+        print(f"Privileged Users: {self.privileged_users}")
+        print(f"Work Hour Start: {self.work_hour_start}")
+        print(f"Work Hour End: {self.work_hour_end}")
+        print(f"Generate PDF: {self.generate_pdf}")
+        print(f"Generate CSV: {self.generate_csv}")
+        print(f"Send Email: {self.send_email}")
+        print()
+        
+        # Check file paths
+        today = datetime.now().strftime('%Y-%m-%d')
+        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        current_log = self.get_log_file_path()
+        yesterday_log = self.get_log_file_path(yesterday)
+        
+        print("=== File Path Check ===")
+        print(f"Today's Log: {current_log} {'✅' if os.path.exists(current_log) else '❌'}")
+        print(f"Yesterday's Log: {yesterday_log} {'✅' if os.path.exists(yesterday_log) else '❌'}")
+
+class AuditLogEntry:
+    """Audit log entry class"""
+    def __init__(self, line: str):
+        self.raw_line = line.strip()
+        self.parse_line()
+    
+    def parse_line(self):
+        """Parse log line"""
+        try:
+            # Use CSV reader to parse
+            reader = csv.reader([self.raw_line])
+            fields = next(reader)
+            
+            if len(fields) >= 6:
+                self.timestamp = fields[0] if fields[0] else ''
+                self.server_host = fields[1] if len(fields) > 1 else ''
+                self.username = fields[2] if len(fields) > 2 else ''
+                self.host = fields[3] if len(fields) > 3 else ''
+                self.connection_id = fields[4] if len(fields) > 4 else ''
+                self.query_id = fields[5] if len(fields) > 5 else ''
+                self.operation = fields[6] if len(fields) > 6 else ''
+                self.database = fields[7] if len(fields) > 7 else ''
+                self.query = fields[8] if len(fields) > 8 else ''
+                self.retcode = fields[9] if len(fields) > 9 else '0'
+            else:
+                # Handle incomplete lines
+                self.timestamp = fields[0] if len(fields) > 0 else ''
+                self.server_host = fields[1] if len(fields) > 1 else ''
+                self.username = fields[2] if len(fields) > 2 else ''
+                self.host = fields[3] if len(fields) > 3 else ''
+                self.connection_id = fields[4] if len(fields) > 4 else ''
+                self.query_id = fields[5] if len(fields) > 5 else ''
+                self.operation = ''
+                self.database = ''
+                self.query = ''
+                self.retcode = '0'
+            
+            # Convert return code to integer
+            try:
+                self.retcode = int(self.retcode)
+            except (ValueError, TypeError):
+                self.retcode = 0
+                
+        except Exception as e:
+            # If parsing fails, set default values
+            self.timestamp = ''
+            self.server_host = ''
+            self.username = ''
+            self.host = ''
+            self.connection_id = ''
+            self.query_id = ''
+            self.operation = ''
+            self.database = ''
+            self.query = ''
+            self.retcode = 0
+    
+    def is_failed_login(self) -> bool:
+        """Check if this is a failed login"""
+        return self.operation == 'CONNECT' and self.retcode != 0
+    
+    def is_privileged_operation(self) -> bool:
+        """Check if this is a privileged operation"""
+        if self.operation != 'QUERY':
+            return False
+        
+        privileged_keywords = [
+            'CREATE USER', 'DROP USER', 'GRANT', 'REVOKE',
+            'CREATE DATABASE', 'DROP DATABASE', 'CREATE TABLE',
+            'DROP TABLE', 'ALTER USER', 'SET PASSWORD'
         ]
         
-        for key in int_keys:
-            try:
-                self.config[key] = int(self.config[key])
-            except (ValueError, TypeError):
-                print(f"警告: {key} 值無效，使用預設值")
-                # 保持原始字串值，讓程式使用預設值
+        query_upper = self.query.upper()
+        return any(keyword in query_upper for keyword in privileged_keywords)
     
-    def get(self, key, default=None):
-        """取得配置值"""
-        return self.config.get(key, default)
-    
-    def get_int(self, key, default=0):
-        """取得整數配置值"""
+    def get_datetime(self) -> Optional[datetime]:
         try:
-            return int(self.config.get(key, default))
-        except (ValueError, TypeError):
-            return default
-    
-    def get_bool(self, key, default=False):
-        """取得布林配置值"""
-        value = self.config.get(key, str(default)).lower()
-        return value in ('true', '1', 'yes', 'on')
-    
-    def print_config(self):
-        """印出當前配置"""
-        print("\n📋 當前配置:")
-        print("-" * 50)
-        for key, value in sorted(self.config.items()):
-            print(f"{key:20} = {value}")
-        print("-" * 50)
-
-class MySQLAuditAnalyzer:
-    def __init__(self, config_file=".env"):
-        self.config = ConfigManager(config_file)
-        self.setup_logging()
-        self.setup_directories()
-        self.setup_fonts()
-        
-    def setup_logging(self):
-        """設定日誌記錄"""
-        log_level = getattr(logging, self.config.get('LOG_LEVEL', 'INFO').upper())
-        log_file = self.config.get('LOG_FILE')
-        
-        # 確保日誌目錄存在
-        log_dir = os.path.dirname(log_file)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-        
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
-        self.logger.info("MySQL 審計分析器已啟動")
-        
-    def setup_directories(self):
-        """確保輸出目錄存在"""
-        output_dir = self.config.get('OUTPUT_DIR')
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir, exist_ok=True)
-            self.logger.info(f"已創建輸出目錄: {output_dir}")
-            
-    def setup_fonts(self):
-        """設定中文字體支援"""
-        try:
-            # 優先使用配置中的字體路徑
-            custom_font = self.config.get('CUSTOM_FONT_PATH')
-            if custom_font and os.path.exists(custom_font):
-                try:
-                    pdfmetrics.registerFont(TTFont('CustomFont', custom_font))
-                    self.font_name = 'CustomFont'
-                    self.logger.info(f"已註冊自定義字體: {custom_font}")
-                    return
-                except Exception as e:
-                    self.logger.warning(f"無法註冊自定義字體 {custom_font}: {e}")
-            
-            # 嘗試使用系統中的中文字體
-            font_paths = [
-                '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-                '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-                '/System/Library/Fonts/Arial.ttf',  # macOS
-                'C:\\Windows\\Fonts\\arial.ttf',  # Windows
-                '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',  # 中文字體
-            ]
-            
-            font_registered = False
-            for font_path in font_paths:
-                if os.path.exists(font_path):
-                    try:
-                        pdfmetrics.registerFont(TTFont('CustomFont', font_path))
-                        self.font_name = 'CustomFont'
-                        font_registered = True
-                        self.logger.info(f"已註冊字體: {font_path}")
-                        break
-                    except Exception as e:
-                        self.logger.warning(f"無法註冊字體 {font_path}: {e}")
-                        continue
-            
-            if not font_registered:
-                self.font_name = 'Helvetica'
-                self.logger.warning("使用預設字體 Helvetica")
-                
-        except Exception as e:
-            self.logger.error(f"字體設定錯誤: {e}")
-            self.font_name = 'Helvetica'
-    
-    def get_log_file(self, target_date=None):
-        """取得指定日期的日誌檔案路徑"""
-        log_dir = self.config.get('LOG_DIR')
-        
-        if target_date:
-            if isinstance(target_date, str):
-                try:
-                    date_obj = datetime.strptime(target_date, self.config.get('DATE_FORMAT'))
-                except ValueError:
-                    self.logger.error(f"日期格式錯誤: {target_date}")
-                    raise
+            # 支援 YYYYMMDD HH:MM:SS
+            if ' ' in self.timestamp:
+                return datetime.strptime(self.timestamp, '%Y%m%d %H:%M:%S')
+            elif len(self.timestamp) == 8:  # YYYYMMDD
+                return datetime.strptime(self.timestamp, '%Y%m%d')
+            elif len(self.timestamp) == 14:  # YYYYMMDDHHMMSS
+                return datetime.strptime(self.timestamp, '%Y%m%d%H%M%S')
             else:
-                date_obj = target_date
-        else:
-            date_obj = datetime.now() - timedelta(days=1)
-        
-        date_str = date_obj.strftime(self.config.get('DATE_FORMAT'))
-        log_file = os.path.join(log_dir, f"server_audit.log-{date_str}")
-        
-        if not os.path.exists(log_file):
-            self.logger.warning(f"找不到指定日期的日誌檔案: {log_file}")
-            # 嘗試當前日誌檔案
-            current_log = os.path.join(log_dir, "server_audit.log")
-            if os.path.exists(current_log):
-                self.logger.info(f"使用當前日誌檔案: {current_log}")
-                return current_log
-            else:
-                raise FileNotFoundError(f"找不到日誌檔案: {log_file}")
-        
-        return log_file
-    
-    def parse_audit_log_line(self, line):
-        """解析審計日誌行"""
-        try:
-            delimiter = self.config.get('LOG_DELIMITER')
-            min_fields = self.config.get_int('MIN_LOG_FIELDS')
-            
-            parts = line.strip().split(delimiter)
-            
-            if len(parts) < min_fields:
                 return None
-                
-            return {
-                'timestamp': parts[0],
-                'server': parts[1],
-                'username': parts[2],
-                'host': parts[3],
-                'connection_id': parts[4],
-                'query_id': parts[5],
-                'operation': parts[6],
-                'database': parts[7] if len(parts) > 7 else '',
-                'query': parts[8] if len(parts) > 8 else '',
-                'retcode': parts[9] if len(parts) > 9 else '0'
-            }
-        except Exception as e:
-            self.logger.warning(f"無法解析日誌行: {line[:100]}... 錯誤: {e}")
+        except ValueError:
             return None
+
+class SecurityAnalyzer:
+    """Security analyzer"""
+    def __init__(self, config: Config):
+        self.config = config
+        self.entries: List[AuditLogEntry] = []
+        self.analysis_results = {}
     
-    def analyze_log_file(self, log_file):
-        """分析日誌檔案"""
-        self.logger.info(f"開始分析日誌檔案: {log_file}")
-        
-        stats = {
-            'total_events': 0,
-            'users': set(),
-            'hosts': set(),
-            'databases': set(),
-            'operations': Counter(),
-            'errors': [],
-            'failed_logins': [],
-            'user_activity': Counter(),
-            'hourly_activity': Counter(),
-            'analysis_date': datetime.now().strftime(self.config.get('DATE_FORMAT'))
-        }
+    def load_log_file(self, file_path: str) -> bool:
+        """Load log file"""
+        if not os.path.exists(file_path):
+            print(f"❌ Log file does not exist: {file_path}")
+            return False
         
         try:
-            with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                for line_num, line in enumerate(f, 1):
-                    if not line.strip():
-                        continue
-                        
-                    record = self.parse_audit_log_line(line)
-                    if not record:
-                        continue
-                    
-                    stats['total_events'] += 1
-                    stats['users'].add(record['username'])
-                    stats['hosts'].add(record['host'])
-                    
-                    if record['database']:
-                        stats['databases'].add(record['database'])
-                    
-                    stats['operations'][record['operation']] += 1
-                    stats['user_activity'][record['username']] += 1
-                    
-                    # 提取小時資訊
-                    try:
-                        if len(record['timestamp']) >= 11:
-                            hour = record['timestamp'][9:11]
-                            stats['hourly_activity'][hour] += 1
-                    except:
-                        pass
-                    
-                    # 檢查錯誤事件
-                    if record['retcode'] != '0' and record['retcode']:
-                        if len(stats['errors']) < self.config.get_int('MAX_ERROR_EVENTS'):
-                            stats['errors'].append({
-                                'timestamp': record['timestamp'],
-                                'username': record['username'],
-                                'host': record['host'],
-                                'operation': record['operation'],
-                                'retcode': record['retcode'],
-                                'query': record['query'][:100] if record['query'] else ''
-                            })
-                    
-                    # 檢查失敗登入
-                    if record['operation'] == 'FAILED_CONNECT':
-                        if len(stats['failed_logins']) < self.config.get_int('MAX_FAILED_LOGINS'):
-                            stats['failed_logins'].append({
-                                'timestamp': record['timestamp'],
-                                'username': record['username'],
-                                'host': record['host']
-                            })
-                        
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            
+            print(f"📁 Loading log file: {file_path}")
+            print(f"📄 Total lines: {len(lines)}")
+            
+            for line in lines:
+                if line.strip():  # Skip empty lines
+                    entry = AuditLogEntry(line)
+                    if entry.timestamp:  # Only add valid entries
+                        self.entries.append(entry)
+            
+            print(f"✅ Successfully parsed {len(self.entries)} log records")
+            return True
+            
         except Exception as e:
-            self.logger.error(f"讀取日誌檔案錯誤: {e}")
-            raise
-        
-        self.logger.info(f"分析完成: 總事件數 {stats['total_events']}")
-        return stats
+            print(f"❌ Error loading log file: {e}")
+            return False
     
-    def create_pdf_report(self, stats, output_file):
-        """生成 PDF 報表"""
-        self.logger.info(f"開始生成 PDF 報表: {output_file}")
+    def analyze(self):
+        """Perform security analysis"""
+        print("🔍 Starting security analysis...")
         
-        # 建立 PDF 文件
-        doc = SimpleDocTemplate(
-            output_file,
-            pagesize=A4,
-            rightMargin=72,
-            leftMargin=72,
-            topMargin=72,
-            bottomMargin=18
-        )
+        # Basic statistics
+        self.analysis_results['total_events'] = len(self.entries)
+        self.analysis_results['unique_users'] = len(set(entry.username for entry in self.entries))
+        self.analysis_results['unique_hosts'] = len(set(entry.host for entry in self.entries))
         
-        # 建立樣式
+        # Analyze failed logins
+        self._analyze_failed_logins()
+        
+        # Analyze suspicious IPs
+        self._analyze_suspicious_ips()
+        
+        # Analyze privileged operations
+        self._analyze_privileged_operations()
+        
+        # Analyze operation statistics
+        self._analyze_operation_stats()
+        
+        # Analyze error codes
+        self._analyze_error_codes()
+
+        # Analyze after-hours access
+        self._analyze_after_hours_access()
+
+        # Analyze privileged user logins
+        self._analyze_privileged_user_logins()
+        
+        print("✅ Security analysis completed")
+    
+    def _analyze_failed_logins(self):
+        """Analyze failed logins"""
+        failed_logins = [entry for entry in self.entries if entry.is_failed_login()]
+        
+        # Count failures by user
+        failed_by_user = Counter(entry.username for entry in failed_logins)
+        
+        # Count failures by IP
+        failed_by_ip = Counter(entry.host for entry in failed_logins)
+        
+        # Find users and IPs exceeding threshold
+        suspicious_users = {user: count for user, count in failed_by_user.items() 
+                          if count >= self.config.failed_login_threshold}
+        
+        suspicious_ips = {ip: count for ip, count in failed_by_ip.items() 
+                         if count >= self.config.failed_login_threshold}
+        
+        self.analysis_results['failed_logins'] = {
+            'total': len(failed_logins),
+            'by_user': dict(failed_by_user.most_common(10)),
+            'by_ip': dict(failed_by_ip.most_common(10)),
+            'suspicious_users': suspicious_users,
+            'suspicious_ips': suspicious_ips,
+            'details': failed_logins[:50]  # Save first 50 detailed records
+        }
+    
+    def _analyze_suspicious_ips(self):
+        """Analyze suspicious IPs"""
+        if not self.config.suspicious_ips:
+            self.analysis_results['suspicious_ip_activity'] = {'total': 0, 'details': []}
+            return
+        
+        suspicious_activities = []
+        
+        for entry in self.entries:
+            if self._is_suspicious_ip(entry.host):
+                suspicious_activities.append(entry)
+        
+        self.analysis_results['suspicious_ip_activity'] = {
+            'total': len(suspicious_activities),
+            'details': suspicious_activities[:50]
+        }
+    
+    def _is_suspicious_ip(self, ip: str) -> bool:
+        """Check if IP is suspicious"""
+        for suspicious_ip in self.config.suspicious_ips:
+            if suspicious_ip.strip():
+                if '/' in suspicious_ip:
+                    # CIDR format check (simplified)
+                    network = suspicious_ip.split('/')[0]
+                    if ip.startswith(network.rsplit('.', 1)[0]):
+                        return True
+                else:
+                    # Exact match
+                    if ip == suspicious_ip.strip():
+                        return True
+        return False
+    
+    def _analyze_privileged_operations(self):
+        """Analyze privileged operations"""
+        privileged_ops = [entry for entry in self.entries if entry.is_privileged_operation()]
+        
+        # Count by user
+        ops_by_user = Counter(entry.username for entry in privileged_ops)
+        
+        self.analysis_results['privileged_operations'] = {
+            'total': len(privileged_ops),
+            'by_user': dict(ops_by_user.most_common(10)),
+            'details': privileged_ops[:50]
+        }
+    
+    def _analyze_operation_stats(self):
+        """Analyze operation statistics"""
+        operation_counts = Counter(entry.operation for entry in self.entries)
+        
+        self.analysis_results['operation_stats'] = dict(operation_counts.most_common())
+    
+    def _analyze_error_codes(self):
+        """Analyze error codes"""
+        error_entries = [entry for entry in self.entries if entry.retcode != 0]
+        error_codes = Counter(entry.retcode for entry in error_entries)
+        
+        self.analysis_results['error_analysis'] = {
+            'total_errors': len(error_entries),
+            'error_codes': dict(error_codes.most_common()),
+            'details': error_entries[:50]
+        }
+
+    def _analyze_after_hours_access(self):
+        """分析特定帳號在非上班時段的存取紀錄（週六日整天皆算非上班時段）"""
+        after_hours_users = getattr(self.config, 'after_hours_users', [])
+        work_hour_start = getattr(self.config, 'work_hour_start', 9)
+        work_hour_end = getattr(self.config, 'work_hour_end', 18)
+
+        after_hours_access = []
+        for entry in self.entries:
+            if entry.username in after_hours_users:
+                dt = entry.get_datetime()
+                if dt:
+                    # 週六(5)、週日(6)整天都算非上班時段
+                    if dt.weekday() >= 5:
+                        after_hours_access.append(entry)
+                    elif not (work_hour_start <= dt.hour < work_hour_end):
+                        after_hours_access.append(entry)
+        self.analysis_results['after_hours_access'] = {
+            'total': len(after_hours_access),
+            'details': after_hours_access[:50]
+        }
+
+    def _analyze_privileged_user_logins(self):
+        """分析特權帳號登入（CONNECT）行為"""
+        privileged_users = getattr(self.config, 'privileged_users', [])
+        privileged_users = [u.strip() for u in privileged_users if u.strip()]
+        privileged_login_entries = [
+            entry for entry in self.entries
+            if entry.operation == 'CONNECT' and entry.username in privileged_users
+        ]
+        logins_by_user = Counter(entry.username for entry in privileged_login_entries)
+        self.analysis_results['privileged_user_logins'] = {
+            'total': len(privileged_login_entries),
+            'by_user': dict(logins_by_user.most_common()),
+            'details': privileged_login_entries[:50]
+        }
+
+class ReportGenerator:
+    """Report generator"""
+    def __init__(self, config: Config, analysis_results: dict):
+        self.config = config
+        self.analysis_results = analysis_results
+        self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    def generate_csv_report(self, output_dir: str) -> str:
+        """Generate CSV report"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        csv_file = os.path.join(output_dir, f'mysql_audit_analysis_{self.timestamp}.csv')
+        
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            # Title
+            writer.writerow([f'{self.config.report_title} - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'])
+            writer.writerow([])
+            
+            # Basic statistics
+            writer.writerow(['=== Basic Statistics ==='])
+            writer.writerow(['Total Events', self.analysis_results.get('total_events', 0)])
+            writer.writerow(['Unique Users', self.analysis_results.get('unique_users', 0)])
+            writer.writerow(['Unique Hosts', self.analysis_results.get('unique_hosts', 0)])
+            writer.writerow([])
+            
+            # Failed login analysis
+            failed_logins = self.analysis_results.get('failed_logins', {})
+            writer.writerow(['=== Failed Login Analysis ==='])
+            writer.writerow(['Total Failed Logins', failed_logins.get('total', 0)])
+            writer.writerow([])
+            
+            if failed_logins.get('suspicious_users'):
+                writer.writerow(['Suspicious Users (Above Threshold)'])
+                writer.writerow(['Username', 'Failed Count'])
+                for user, count in failed_logins['suspicious_users'].items():
+                    writer.writerow([user, count])
+                writer.writerow([])
+            
+            if failed_logins.get('suspicious_ips'):
+                writer.writerow(['Suspicious IPs (Above Threshold)'])
+                writer.writerow(['IP Address', 'Failed Count'])
+                for ip, count in failed_logins['suspicious_ips'].items():
+                    writer.writerow([ip, count])
+                writer.writerow([])
+            
+            # Privileged operations analysis
+            privileged_ops = self.analysis_results.get('privileged_operations', {})
+            writer.writerow(['=== Privileged Operations Analysis ==='])
+            writer.writerow(['Total Privileged Operations', privileged_ops.get('total', 0)])
+            writer.writerow([])
+            
+            if privileged_ops.get('by_user'):
+                writer.writerow(['By User Statistics'])
+                writer.writerow(['Username', 'Operation Count'])
+                for user, count in privileged_ops['by_user'].items():
+                    writer.writerow([user, count])
+                writer.writerow([])
+            
+            # Privileged user login analysis
+            priv_user_logins = self.analysis_results.get('privileged_user_logins', {})
+            writer.writerow(['=== Privileged Account Login Analysis ==='])
+            writer.writerow(['Total Privileged Account Logins', priv_user_logins.get('total', 0)])
+            if priv_user_logins.get('by_user'):
+                writer.writerow(['Username', 'Login Count'])
+                for user, count in priv_user_logins['by_user'].items():
+                    writer.writerow([user, count])
+            writer.writerow([])
+
+            # --- 新增詳細登入行為 ---
+            if priv_user_logins.get('details'):
+                writer.writerow(['Detailed Privileged Account Login Records'])
+                writer.writerow(['Username', 'Host', 'Timestamp'])
+                for entry in priv_user_logins['details']:
+                    dt = entry.get_datetime()
+                    writer.writerow([
+                        entry.username,
+                        entry.host,
+                        dt.strftime('%Y-%m-%d %H:%M:%S') if dt else entry.timestamp
+                    ])
+                writer.writerow([])
+            # --- end ---
+
+            # Operation statistics
+            writer.writerow(['=== Operation Type Statistics ==='])
+            writer.writerow(['Operation Type', 'Count'])
+            for operation, count in self.analysis_results.get('operation_stats', {}).items():
+                writer.writerow([operation, count])
+            writer.writerow([])
+            
+            # Error analysis
+            error_analysis = self.analysis_results.get('error_analysis', {})
+            writer.writerow(['=== Error Analysis ==='])
+            writer.writerow(['Total Errors', error_analysis.get('total_errors', 0)])
+            writer.writerow([])
+            
+            if error_analysis.get('error_codes'):
+                writer.writerow(['Error Code Statistics'])
+                writer.writerow(['Error Code', 'Count'])
+                for code, count in error_analysis['error_codes'].items():
+                    writer.writerow([code, count])
+            writer.writerow([])
+
+            # After-hours access
+            after_hours = self.analysis_results.get('after_hours_access', {})
+            writer.writerow(['=== After-hours Access (Specify account) ==='])
+            writer.writerow(['Total After-hours Access', after_hours.get('total', 0)])
+            if after_hours.get('details'):
+                writer.writerow(['Username', 'Host', 'Operation', 'Time'])
+                for entry in after_hours['details']:
+                    dt = entry.get_datetime()
+                    writer.writerow([entry.username, entry.host, entry.operation, dt.strftime('%Y-%m-%d %H:%M:%S') if dt else entry.timestamp])
+            writer.writerow([])
+        
+        print(f"✅ CSV report generated: {csv_file}")
+        return csv_file
+    
+    def generate_pdf_report(self, output_dir: str) -> str:
+        """Generate PDF report"""
+        if not REPORTLAB_AVAILABLE:
+            print("❌ ReportLab not installed, cannot generate PDF report")
+            print("Please run: pip install reportlab")
+            return None
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        pdf_file = os.path.join(output_dir, f'mysql_audit_analysis_{self.timestamp}.pdf')
+        
+        doc = SimpleDocTemplate(pdf_file, pagesize=A4)
         styles = getSampleStyleSheet()
+        story = []
         
-        # 從配置讀取字體大小
-        title_font_size = self.config.get_int('PDF_TITLE_FONT_SIZE', 18)
-        heading_font_size = self.config.get_int('PDF_HEADING_FONT_SIZE', 14)
-        normal_font_size = self.config.get_int('PDF_FONT_SIZE', 10)
-        
-        # 標題樣式
+        # Title
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
-            fontName=self.font_name,
-            fontSize=title_font_size,
+            fontSize=16,
             spaceAfter=30,
-            alignment=TA_CENTER,
-            textColor=colors.darkblue
+            alignment=1  # Center
         )
         
-        # 副標題樣式
-        heading_style = ParagraphStyle(
-            'CustomHeading',
-            parent=styles['Heading2'],
-            fontName=self.font_name,
-            fontSize=heading_font_size,
-            spaceAfter=12,
-            textColor=colors.darkgreen
-        )
-        
-        # 內容樣式
-        normal_style = ParagraphStyle(
-            'CustomNormal',
-            parent=styles['Normal'],
-            fontName=self.font_name,
-            fontSize=normal_font_size
-        )
-        
-        # 建立內容
-        story = []
-        
-        # 標題
-        report_title = self.config.get('REPORT_TITLE', 'MySQL Audit Report')
-        company_name = self.config.get('COMPANY_NAME', '')
-        
-        if company_name:
-            story.append(Paragraph(company_name, normal_style))
-            story.append(Spacer(1, 10))
-        
-        title_text = f"{report_title} - {stats['analysis_date']}"
-        story.append(Paragraph(title_text, title_style))
+        story.append(Paragraph(self.config.report_title, title_style))
+        story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
         story.append(Spacer(1, 20))
         
-        # 總覽統計
-        story.append(Paragraph("Overview Statistics", heading_style))
-        overview_data = [
-            ['Metric', 'Value'],
-            ['Total Events', str(stats['total_events'])],
-            ['Active Users', str(len(stats['users']))],
-            ['Connected Hosts', str(len(stats['hosts']))],
-            ['Databases Used', str(len(stats['databases']))],
-            ['Error Events', str(len(stats['errors']))],
-            ['Failed Logins', str(len(stats['failed_logins']))]
+        # Basic statistics
+        story.append(Paragraph("Basic Statistics", styles['Heading2']))
+        basic_stats = [
+            ['Total Events', str(self.analysis_results.get('total_events', 0))],
+            ['Unique Users', str(self.analysis_results.get('unique_users', 0))],
+            ['Unique Hosts', str(self.analysis_results.get('unique_hosts', 0))]
         ]
         
-        overview_table = Table(overview_data, colWidths=[3*inch, 2*inch])
-        overview_table.setStyle(TableStyle([
+        table = Table(basic_stats)
+        table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), self.font_name),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 14),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
             ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('FONTNAME', (0, 1), (-1, -1), self.font_name),
-            ('FONTSIZE', (0, 1), (-1, -1), normal_font_size),
             ('GRID', (0, 0), (-1, -1), 1, colors.black)
         ]))
-        
-        story.append(overview_table)
+        story.append(table)
         story.append(Spacer(1, 20))
         
-        # Top 活躍用戶
-        top_users_count = self.config.get_int('TOP_USERS_COUNT', 10)
-        story.append(Paragraph(f"Top {top_users_count} Active Users", heading_style))
-        user_data = [['Username', 'Activity Count']]
-        for user, count in stats['user_activity'].most_common(top_users_count):
-            user_data.append([str(user), str(count)])
+        # Security warnings
+        story.append(Paragraph("Security Warnings", styles['Heading2']))
         
-        user_table = Table(user_data, colWidths=[3*inch, 2*inch])
-        user_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightblue),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.darkblue),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, -1), self.font_name),
-            ('FONTSIZE', (0, 0), (-1, -1), normal_font_size),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.lightcyan),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        
-        story.append(user_table)
-        story.append(Spacer(1, 20))
-        
-        # Top 操作類型
-        top_ops_count = self.config.get_int('TOP_OPERATIONS_COUNT', 10)
-        story.append(Paragraph(f"Top {top_ops_count} Operations", heading_style))
-        op_data = [['Operation Type', 'Count']]
-        for operation, count in stats['operations'].most_common(top_ops_count):
-            op_data.append([str(operation), str(count)])
-        
-        op_table = Table(op_data, colWidths=[3*inch, 2*inch])
-        op_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgreen),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.darkgreen),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, -1), self.font_name),
-            ('FONTSIZE', (0, 0), (-1, -1), normal_font_size),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.honeydew),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        
-        story.append(op_table)
-        story.append(Spacer(1, 20))
-        
-        # 錯誤事件
-        if stats['errors']:
-            story.append(Paragraph("Error Events", heading_style))
-            error_data = [['Time', 'User', 'Host', 'Operation', 'Error Code']]
-            for error in stats['errors']:
-                error_data.append([
-                    str(error['timestamp']),
-                    str(error['username']),
-                    str(error['host']),
-                    str(error['operation']),
-                    str(error['retcode'])
-                ])
+        failed_logins = self.analysis_results.get('failed_logins', {})
+        if failed_logins.get('suspicious_users') or failed_logins.get('suspicious_ips'):
+            if failed_logins.get('suspicious_users'):
+                story.append(Paragraph("⚠️ Suspicious user activity detected:", styles['Normal']))
+                for user, count in failed_logins['suspicious_users'].items():
+                    story.append(Paragraph(f"• {user}: {count} failed logins", styles['Normal']))
+                story.append(Spacer(1, 10))
             
-            error_table = Table(error_data, colWidths=[1.5*inch, 1*inch, 1.5*inch, 1*inch, 1*inch])
-            error_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.red),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            if failed_logins.get('suspicious_ips'):
+                story.append(Paragraph("⚠️ Suspicious IP activity detected:", styles['Normal']))
+                for ip, count in failed_logins['suspicious_ips'].items():
+                    story.append(Paragraph(f"• {ip}: {count} failed logins", styles['Normal']))
+        else:
+            story.append(Paragraph("✅ No obvious security threats detected", styles['Normal']))
+        
+        story.append(Spacer(1, 20))
+        
+        # Operation statistics
+        story.append(Paragraph("Operation Type Statistics", styles['Heading2']))
+        operation_data = [['Operation Type', 'Count']]
+        for operation, count in list(self.analysis_results.get('operation_stats', {}).items())[:10]:
+            operation_data.append([operation, str(count)])
+        
+        if len(operation_data) > 1:
+            table = Table(operation_data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, -1), self.font_name),
-                ('FONTSIZE', (0, 0), (-1, -1), normal_font_size-1),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.mistyrose),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
                 ('GRID', (0, 0), (-1, -1), 1, colors.black)
             ]))
-            
-            story.append(error_table)
+            story.append(table)
+        story.append(Spacer(1, 20))
+
+        # Privileged user login analysis
+        story.append(Paragraph("Privileged Account Login Analysis", styles['Heading2']))
+        priv_user_logins = self.analysis_results.get('privileged_user_logins', {})
+        story.append(Paragraph(f"Total privileged account logins: {priv_user_logins.get('total', 0)}", styles['Normal']))
+        if priv_user_logins.get('by_user'):
+            data = [['Username', 'Login Count']]
+            for user, count in priv_user_logins['by_user'].items():
+                data.append([user, str(count)])
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            story.append(table)
+        story.append(Spacer(1, 20))
+
+        # --- 新增詳細登入行為 ---
+        if priv_user_logins.get('details'):
+            story.append(Paragraph("Detailed Privileged Account Login Records (Top 50)", styles['Heading3']))
+            data = [['Username', 'Host', 'Timestamp']]
+            for entry in priv_user_logins['details']:
+                dt = entry.get_datetime()
+                data.append([
+                    entry.username,
+                    entry.host,
+                    dt.strftime('%Y-%m-%d %H:%M:%S') if dt else entry.timestamp
+                ])
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            story.append(table)
             story.append(Spacer(1, 20))
-        
-        # 失敗登入事件
-        if stats['failed_logins']:
-            story.append(Paragraph("Failed Login Events", heading_style))
-            login_data = [['Time', 'Username', 'Source Host']]
-            for login in stats['failed_logins']:
-                login_data.append([
-                    str(login['timestamp']),
-                    str(login['username']),
-                    str(login['host'])
+        # --- end ---
+
+        # After-hours access
+        story.append(Paragraph("After-hours Access (Specify account)", styles['Heading2']))
+        after_hours = self.analysis_results.get('after_hours_access', {})
+        story.append(Paragraph(f"Total after-hours access: {after_hours.get('total', 0)}", styles['Normal']))
+        if after_hours.get('details'):
+            data = [['Username', 'Host', 'Operation', 'Time']]
+            for entry in after_hours['details']:
+                dt = entry.get_datetime()
+                data.append([
+                    entry.username, entry.host, entry.operation,
+                    dt.strftime('%Y-%m-%d %H:%M:%S') if dt else entry.timestamp
                 ])
-            
-            login_table = Table(login_data, colWidths=[2*inch, 1.5*inch, 2.5*inch])
-            login_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.orange),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, -1), self.font_name),
-                ('FONTSIZE', (0, 0), (-1, -1), normal_font_size),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.papayawhip),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
                 ('GRID', (0, 0), (-1, -1), 1, colors.black)
             ]))
-            
-            story.append(login_table)
+            story.append(table)
+        story.append(Spacer(1, 20))
         
-        # 生成 PDF
-        try:
-            doc.build(story)
-            self.logger.info(f"PDF 報表生成成功: {output_file}")
-        except Exception as e:
-            self.logger.error(f"PDF 生成錯誤: {e}")
-            raise
+        doc.build(story)
+        print(f"✅ PDF report generated: {pdf_file}")
+        return pdf_file
     
-    def generate_report(self, target_date=None):
-        """生成報表主函數"""
-        try:
-            # 取得日誌檔案
-            log_file = self.get_log_file(target_date)
-            
-            # 分析日誌
-            stats = self.analyze_log_file(log_file)
-            
-            # 生成 PDF 檔案名稱
-            if target_date:
-                if isinstance(target_date, str):
-                    date_str = target_date
-                else:
-                    date_str = target_date.strftime(self.config.get('DATE_FORMAT'))
-            else:
-                yesterday = datetime.now() - timedelta(days=1)
-                date_str = yesterday.strftime(self.config.get('DATE_FORMAT'))
-            
-            output_dir = self.config.get('OUTPUT_DIR')
-            output_file = os.path.join(output_dir, f"mysql_audit_report_{date_str}.pdf")
-            
-            # 生成 PDF 報表
-            self.create_pdf_report(stats, output_file)
-            
-            self.logger.info(f"報表生成完成: {output_file}")
-            return output_file
-            
-        except Exception as e:
-            self.logger.error(f"報表生成失敗: {e}")
-            raise
+def send_email_with_attachment(config: Config, attachment_path: str, body: str = ""):
+    if not config.smtp_host or not config.mail_to:
+        print("❌ SMTP 設定不完整，無法發送郵件")
+        return False
+
+    msg = EmailMessage()
+    msg['Subject'] = getattr(config, 'mail_subject', 'MySQL Audit Log Report')
+    msg['From'] = formataddr((getattr(config, 'company_name', ''), getattr(config, 'mail_from', '')))
+    msg['To'] = ", ".join(getattr(config, 'mail_to', []))
+    msg.set_content(body or f'報表使用昨日紀錄生成，詳見附件：{os.path.basename(attachment_path)}')
+
+    # 加入 PDF 附件
+    with open(attachment_path, 'rb') as f:
+        file_data = f.read()
+        file_name = os.path.basename(attachment_path)
+        msg.add_attachment(file_data, maintype='application', subtype='pdf', filename=file_name)
+
+    try:
+        # 直接連線 SMTP，不啟用 TLS、不登入
+        with smtplib.SMTP(getattr(config, 'smtp_host', ''), getattr(config, 'smtp_port', 25)) as smtp:
+            smtp.send_message(msg)
+        print(f"✅ 郵件已發送至 {getattr(config, 'mail_to', [])}")
+        return True
+    except Exception as e:
+        print(f"❌ 發送郵件失敗: {e}")
+        return False
 
 def main():
-    """主函數"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='MySQL 審計日誌分析器')
-    parser.add_argument('--config', '-c', default='.env', 
-                       help='配置檔案路徑 (預設: .env)')
-    parser.add_argument('--date', '-d', 
-                       help='分析指定日期的日誌 (格式: YYYY-MM-DD)')
-    parser.add_argument('--show-config', action='store_true',
-                       help='顯示當前配置')
+    """Main function"""
+    parser = argparse.ArgumentParser(description='MySQL Audit Log Security Analyzer')
+    parser.add_argument('--date', help='Analyze logs for specific date (format: YYYY-MM-DD, default: today)')
+    parser.add_argument('--output-dir', help='Output directory')
+    parser.add_argument('--csv-only', action='store_true', help='Generate CSV report only')
+    parser.add_argument('--pdf-only', action='store_true', help='Generate PDF report only')
+    parser.add_argument('--show-config', action='store_true', help='Show current configuration')
+    parser.add_argument('--env-file', help='Specify environment file path')
     
     args = parser.parse_args()
     
-    try:
-        analyzer = MySQLAuditAnalyzer(args.config)
-        
-        if args.show_config:
-            analyzer.config.print_config()
-            return 0
-        
-        report_file = analyzer.generate_report(args.date)
-        print(f"✅ MySQL 審計報表已生成: {report_file}")
-        
-    except Exception as e:
-        print(f"❌ 錯誤: {e}")
-        return 1
+    # Load configuration
+    config = Config(args.env_file)
     
-    return 0
+    if args.show_config:
+        config.show_config()
+        return
+    
+    # 決定分析日期（預設為今天）
+    if args.date:
+        try:
+            analysis_date = datetime.strptime(args.date, '%Y-%m-%d')
+            date_str = analysis_date.strftime('%Y-%m-%d')
+        except ValueError:
+            print("❌ Invalid date format, please use YYYY-MM-DD format")
+            return
+    else:
+        analysis_date = datetime.now()
+        date_str = analysis_date.strftime('%Y-%m-%d')
+    
+    print(f"📅 Analysis date: {date_str}")
+    
+    # 不論今天或歷史，**都用 date_str 當尾碼**
+    log_file_path = config.get_log_file_path(date_str)
+    
+    # Initialize analyzer
+    analyzer = SecurityAnalyzer(config)
+    
+    # Load and analyze logs
+    if not analyzer.load_log_file(log_file_path):
+        return
+    
+    analyzer.analyze()
+    
+    # Determine output directory
+    output_dir = args.output_dir or config.output_dir
+    
+    # Generate reports（依照 env 設定與參數決定）
+    report_generator = ReportGenerator(config, analyzer.analysis_results)
+    generated_files = []
+
+    # 決定是否產生 CSV/PDF
+    generate_csv = config.generate_csv if not args.pdf_only else False
+    generate_pdf = config.generate_pdf if not args.csv_only else False
+
+    if generate_csv:
+        csv_file = report_generator.generate_csv_report(output_dir)
+        if csv_file:
+            generated_files.append(csv_file)
+
+    if generate_pdf:
+        pdf_file = report_generator.generate_pdf_report(output_dir)
+        if pdf_file:
+            generated_files.append(pdf_file)
+            if config.send_email:
+                send_email_with_attachment(config, pdf_file)
+            else:
+                print("✉️  SEND_EMAIL 設定為 false，未寄出郵件")
+    
+    # Display result summary
+    print("\n" + "="*50)
+    print("📊 Analysis Result Summary")
+    print("="*50)
+    print(f"Total Events: {analyzer.analysis_results.get('total_events', 0)}")
+    print(f"Failed Logins: {analyzer.analysis_results.get('failed_logins', {}).get('total', 0)}")
+    print(f"Privileged Operations: {analyzer.analysis_results.get('privileged_operations', {}).get('total', 0)}")
+    print(f"Privileged Account Logins: {analyzer.analysis_results.get('privileged_user_logins', {}).get('total', 0)}")
+    print(f"Error Events: {analyzer.analysis_results.get('error_analysis', {}).get('total_errors', 0)}")
+    
+    failed_logins = analyzer.analysis_results.get('failed_logins', {})
+    if failed_logins.get('suspicious_users'):
+        print(f"\n⚠️  Suspicious Users: {len(failed_logins['suspicious_users'])}")
+    if failed_logins.get('suspicious_ips'):
+        print(f"⚠️  Suspicious IPs: {len(failed_logins['suspicious_ips'])}")
+    
+    after_hours = analyzer.analysis_results.get('after_hours_access', {})
+    if after_hours.get('total', 0):
+        print(f"⚠️  After-hours access (Specify account): {after_hours.get('total', 0)}")
+    
+    print(f"\n📁 Generated report files:")
+    for file_path in generated_files:
+        print(f"   • {file_path}")
 
 if __name__ == "__main__":
-    exit(main())
+    main()
