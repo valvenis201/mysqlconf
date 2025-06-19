@@ -1,16 +1,21 @@
-20240526 10:30:15,localhost.localdomain,root,localhost,1,0,CONNECT,,,0
-20240526 10:30:16,localhost.localdomain,root,localhost,1,1,QUERY,mysql,'SELECT @@version',0
-20240526 10:30:17,localhost.localdomain,root,localhost,1,2,QUERY,information_schema,'SELECT * FROM tables',0
-20240526 10:31:00,localhost.localdomain,user1,192.168.1.100,2,0,CONNECT,,,0
-20240526 10:31:01,localhost.localdomain,user1,192.168.1.100,2,3,QUERY,testdb,'SELECT * FROM users',0
-20240526 10:31:15,localhost.localdomain,user2,192.168.1.101,3,0,FAILED_CONNECT,,,1045
-20240526 10:32:00,localhost.localdomain,user1,192.168.1.100,2,4,QUERY,testdb,'INSERT INTO logs VALUES (1, "test")',0
-20240526 10:32:30,localhost.localdomain,admin,192.168.1.50,4,0,CONNECT,,,0
-20240526 10:32:31,localhost.localdomain,admin,192.168.1.50,4,5,QUERY,mysql,'DROP TABLE test',1146
-20240526 10:33:00,localhost.localdomain,user3,192.168.1.102,5,0,FAILED_CONNECT,,,1045
-20240526 11:00:00,localhost.localdomain,root,localhost,1,6,QUERY,mysql,'SHOW PROCESSLIST',0
-20240526 11:15:30,localhost.localdomain,user1,192.168.1.100,2,7,QUERY,testdb,'UPDATE users SET status=1',0
-20240526 11:30:45,localhost.localdomain,backup,192.168.1.200,6,0,CONNECT,,,0
-20240526 11:30:46,localhost.localdomain,backup,192.168.1.200,6,8,QUERY,testdb,'SELECT * FROM users FOR BACKUP',0
-20240526 12:00:00,localhost.localdomain,user2,192.168.1.101,7,0,CONNECT,,,0
-20240526 12:00:01,localhost.localdomain,user2,192.168.1.101,7,9,QUERY,testdb,'DELETE FROM temp_table',0
+20240619 08:55:01,db1,alice,192.168.1.10,1001,2001,CONNECT,,,"",0
+20240619 09:01:05,db1,bob,192.168.1.11,1002,2002,CONNECT,,,"",1045
+20240619 09:02:00,db1,bob,192.168.1.11,1002,2003,CONNECT,,,"",1045
+20240619 09:03:00,db1,bob,192.168.1.11,1002,2004,CONNECT,,,"",1045
+20240619 09:04:00,db1,bob,192.168.1.11,1002,2005,CONNECT,,,"",1045
+20240619 09:05:00,db1,bob,192.168.1.11,1002,2006,CONNECT,,,"",1045
+20240619 09:06:00,db1,bob,192.168.1.11,1002,2007,CONNECT,,,"",1045
+20240619 09:07:00,db1,carol,192.168.1.12,1003,2008,CONNECT,,,"",0
+20240619 09:10:00,db1,admin,203.0.113.1,1004,2009,CONNECT,,,"",0
+20240619 09:12:00,db1,admin,203.0.113.1,1004,2010,QUERY,auditdb,"CREATE USER 'hacker'@'%'",0
+20240619 09:13:00,db1,admin,203.0.113.1,1004,2011,QUERY,auditdb,"GRANT ALL PRIVILEGES ON *.* TO 'hacker'@'%'",0
+20240619 09:14:00,db1,admin,203.0.113.1,1004,2012,QUERY,auditdb,"DROP USER 'olduser'@'%'",0
+20240619 09:15:00,db1,alice,192.168.1.10,1001,2013,QUERY,auditdb,"SELECT * FROM users",0
+20240619 09:16:00,db1,alice,192.168.1.10,1001,2014,QUERY,auditdb,"UPDATE users SET pw='1234' WHERE user='alice'",0
+20240619 09:17:00,db1,carol,192.168.1.12,1003,2015,QUERY,auditdb,"DROP TABLE secret",0
+20240619 19:05:00,db1,nightowl,198.51.100.5,1005,2016,QUERY,auditdb,"SELECT * FROM sensitive",0
+20240615 10:30:00,db1,admin,203.0.113.1,1004,2017,CONNECT,,,"",0
+20240615 10:31:00,db1,admin,203.0.113.1,1004,2018,QUERY,auditdb,"ALTER USER 'admin'@'%'",0
+20240615 10:32:00,db1,admin,203.0.113.1,1004,2019,QUERY,auditdb,"SET PASSWORD FOR 'admin'@'%'",0
+20240619 09:20:00,db1,alice,192.168.1.10,1001,2020,QUERY,auditdb,"SELECT * FROM users",1064
+20240619 09:21:00,db1,alice,192.168.1.10,1001,2021,QUERY,auditdb,"SELECT * FROM users",1146
