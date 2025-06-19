@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-MySQL Audit Log Security Analyzer (with Privileged Account Login Analysis)
-"""
 
-import csv, os, sys, argparse, re, json, smtplib
+import os, sys, argparse, gzip, csv, calendar
 from datetime import datetime, timedelta
-from collections import defaultdict, Counter
-from pathlib import Path
 from typing import List, Optional
+import pymysql
+import smtplib
 from email.message import EmailMessage
-from email.utils import formataddr
+
+# 加入 dotenv 支援
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("❌ 請先安裝 python-dotenv：pip install python-dotenv")
+    sys.exit(1)
 
 try:
     from reportlab.lib.pagesizes import A4
@@ -21,449 +25,618 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
-try:
-    from dotenv import load_dotenv
-    DOTENV_AVAILABLE = True
-except ImportError:
-    DOTENV_AVAILABLE = False
-
 class Config:
-    def __init__(self, env_file=None):
-        self.env_file = env_file or '.env'
-        self.load_config()
-    def load_config(self):
-        if DOTENV_AVAILABLE and os.path.exists(self.env_file):
-            load_dotenv(self.env_file)
-        getenv = os.getenv
-        self.company_name = getenv('COMPANY_NAME', 'Your Company')
-        self.report_title = getenv('REPORT_TITLE', 'MySQL Audit Log Security Analysis Report')
-        self.log_base_path = getenv('LOG_BASE_PATH', '/var/log/mysql/audit')
-        self.log_file_prefix = getenv('LOG_FILE_PREFIX', 'server_audit.log')
-        self.output_dir = getenv('OUTPUT_DIR', '/tmp/mysql_reports')
-        self.failed_login_threshold = int(getenv('FAILED_LOGIN_THRESHOLD', '5'))
-        self.suspicious_ips = [ip.strip() for ip in getenv('SUSPICIOUS_IPS', '').split(',') if ip.strip()]
-        self.include_detailed_logs = getenv('INCLUDE_DETAILED_LOGS', 'true').lower() == 'true'
-        self.max_events_in_report = int(getenv('MAX_EVENTS_IN_REPORT', '1000'))
-        self.after_hours_users = [u.strip() for u in getenv('AFTER_HOURS_USERS', '').split(',') if u.strip()]
-        self.work_hour_start = int(getenv('WORK_HOUR_START', '9'))
-        self.work_hour_end = int(getenv('WORK_HOUR_END', '18'))
-        self.privileged_users = [u.strip() for u in getenv('PRIVILEGED_USERS', '').split(',') if u.strip()]
-        self.smtp_host = getenv('SMTP_HOST', '')
-        self.smtp_port = int(getenv('SMTP_PORT', '587'))
-        self.smtp_user = getenv('SMTP_USER', '')
-        self.smtp_password = getenv('SMTP_PASSWORD', '')
-        self.mail_from = getenv('MAIL_FROM', self.smtp_user)
-        self.mail_to = [m.strip() for m in getenv('MAIL_TO', '').split(',') if m.strip()]
-        self.mail_subject = getenv('MAIL_SUBJECT', self.report_title)
-        self.generate_pdf = getenv('GENERATE_PDF', 'true').lower() == 'true'
-        self.generate_csv = getenv('GENERATE_CSV', 'true').lower() == 'true'
-        self.send_email = getenv('SEND_EMAIL', 'false').lower() == 'true'
+    def __init__(self):
+        self.mysql_host = os.getenv('MYSQL_HOST', 'localhost')
+        self.mysql_port = int(os.getenv('MYSQL_PORT', '3306'))
+        self.mysql_user = os.getenv('MYSQL_USER', 'root')
+        self.mysql_password = os.getenv('MYSQL_PASSWORD', '')
+        self.mysql_db = os.getenv('MYSQL_DB', 'auditdb')
+        self.log_base_path = os.getenv('LOG_BASE_PATH', '/var/log/mysql/audit')
+        self.log_file_prefix = os.getenv('LOG_FILE_PREFIX', 'server_audit.log')
+        self.output_dir = os.getenv('OUTPUT_DIR', '/tmp/mysql_reports')
+        self.failed_login_threshold = int(os.getenv('FAILED_LOGIN_THRESHOLD', '5'))
+        self.allowed_ips = [ip.strip() for ip in os.getenv('ALLOWED_IPS', '').split(',') if ip.strip()]
+        self.after_hours_users = [u.strip() for u in os.getenv('AFTER_HOURS_USERS', '').split(',') if u.strip()]
+        self.work_hour_start = int(os.getenv('WORK_HOUR_START', '9'))
+        self.work_hour_end = int(os.getenv('WORK_HOUR_END', '18'))
+        self.privileged_users = [u.strip() for u in os.getenv('PRIVILEGED_USERS', '').split(',') if u.strip()]
+        self.report_title = os.getenv('REPORT_TITLE', 'MySQL Audit Log Security Analysis Report')
+        self.company_name = os.getenv('COMPANY_NAME', 'Your Company')
+        self.generate_pdf = os.getenv('GENERATE_PDF', 'true').lower() == 'true'
+        self.generate_csv = os.getenv('GENERATE_CSV', 'true').lower() == 'true'
+        self.privileged_keywords = [k.strip() for k in os.getenv(
+            'PRIVILEGED_KEYWORDS',
+            'CREATE USER,DROP USER,GRANT,REVOKE,CREATE DATABASE,DROP DATABASE,CREATE TABLE,DROP TABLE,ALTER USER,SET PASSWORD'
+        ).split(',') if k.strip()]
+        self.send_email = os.getenv('SEND_EMAIL', 'false').lower() == 'true'
+        self.smtp_server = os.getenv('SMTP_SERVER', '')
+        self.smtp_port = int(os.getenv('SMTP_PORT', '25')) 
+        self.mail_from = os.getenv('MAIL_FROM', '')
+        self.mail_to = [m.strip() for m in os.getenv('MAIL_TO', '').split(',') if m.strip()]
+
     def get_log_file_path(self, date_str: str = None) -> str:
         return os.path.join(self.log_base_path, self.log_file_prefix if not date_str else f"{self.log_file_prefix}-{date_str}")
-    def show_config(self):
-        print("=== MySQL Audit Log Analyzer Configuration ===")
-        attrs = [
-            'company_name','report_title','log_base_path','log_file_prefix','output_dir',
-            'failed_login_threshold','suspicious_ips','include_detailed_logs','max_events_in_report',
-            'after_hours_users','privileged_users','work_hour_start','work_hour_end',
-            'generate_pdf','generate_csv','send_email'
-        ]
-        for a in attrs:
-            print(f"{a.replace('_',' ').title()}: {getattr(self,a)}")
-        today = datetime.now().strftime('%Y-%m-%d')
-        yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        for label, date in [("Today's Log", today), ("Yesterday's Log", yesterday)]:
-            path = self.get_log_file_path(date)
-            print(f"{label}: {path} {'✅' if os.path.exists(path) else '❌'}")
 
-class AuditLogEntry:
-    def __init__(self, line: str):
-        self.raw_line = line.strip()
-        self.parse_line()
-    def parse_line(self):
-        try:
-            reader = csv.reader([self.raw_line])
-            fields = next(reader)
-            fields += [''] * (10 - len(fields))
-            (self.timestamp, self.server_host, self.username, self.host,
-             self.connection_id, self.query_id, self.operation, self.database,
-             self.query, self.retcode) = fields[:10]
-            try: self.retcode = int(self.retcode)
-            except: self.retcode = 0
-        except Exception:
-            self.timestamp = self.server_host = self.username = self.host = ''
-            self.connection_id = self.query_id = self.operation = ''
-            self.database = self.query = ''
-            self.retcode = 0
-    def is_failed_login(self) -> bool:
-        return self.operation == 'CONNECT' and self.retcode != 0
-    def is_privileged_operation(self) -> bool:
-        if self.operation != 'QUERY': return False
-        keywords = [
-            'CREATE USER', 'DROP USER', 'GRANT', 'REVOKE',
-            'CREATE DATABASE', 'DROP DATABASE', 'CREATE TABLE',
-            'DROP TABLE', 'ALTER USER', 'SET PASSWORD'
-        ]
-        q = self.query.upper()
-        return any(k in q for k in keywords)
-    def get_datetime(self) -> Optional[datetime]:
-        for fmt in ['%Y%m%d %H:%M:%S', '%Y%m%d', '%Y%m%d%H%M%S']:
-            try: return datetime.strptime(self.timestamp, fmt)
-            except: continue
+    def as_dict(self):
+        return {
+            "MYSQL_HOST": self.mysql_host,
+            "MYSQL_PORT": self.mysql_port,
+            "MYSQL_USER": self.mysql_user,
+            "MYSQL_PASSWORD": self.mysql_password,
+            "MYSQL_DB": self.mysql_db,
+            "LOG_BASE_PATH": self.log_base_path,
+            "LOG_FILE_PREFIX": self.log_file_prefix,
+            "OUTPUT_DIR": self.output_dir,
+            "FAILED_LOGIN_THRESHOLD": self.failed_login_threshold,
+            "ALLOWED_IPS": self.allowed_ips,
+            "AFTER_HOURS_USERS": self.after_hours_users,
+            "WORK_HOUR_START": self.work_hour_start,
+            "WORK_HOUR_END": self.work_hour_end,
+            "PRIVILEGED_USERS": self.privileged_users,
+            "REPORT_TITLE": self.report_title,
+            "COMPANY_NAME": self.company_name,
+            "GENERATE_PDF": self.generate_pdf,
+            "GENERATE_CSV": self.generate_csv,
+            "PRIVILEGED_KEYWORDS": self.privileged_keywords,
+            "SEND_EMAIL": self.send_email,
+            "SMTP_SERVER": self.smtp_server,
+            "SMTP_PORT": self.smtp_port,
+            "MAIL_FROM": self.mail_from,
+            "MAIL_TO": self.mail_to,
+        }
+
+def get_db_conn(config: Config):
+    return pymysql.connect(
+        host=config.mysql_host,
+        port=config.mysql_port,
+        user=config.mysql_user,
+        password=config.mysql_password,
+        database=config.mysql_db,
+        charset='utf8mb4',
+        autocommit=True
+    )
+
+def import_log_file_to_db(file_path, log_date, conn):
+    with (gzip.open(file_path, 'rt', encoding='utf-8', errors='ignore') if file_path.endswith('.gz') else open(file_path, 'r', encoding='utf-8', errors='ignore')) as f:
+        reader = csv.reader(f)
+        data = []
+        for row in reader:
+            row += [''] * (10 - len(row))
+            timestamp, server_host, username, host, connection_id, query_id, operation, database, query, retcode = row[:10]
+            try:
+                retcode = int(retcode)
+            except:
+                retcode = 0
+            data.append((log_date, timestamp, server_host, username, host, connection_id, query_id, operation, database, query, retcode))
+        with conn.cursor() as cur:
+            sql = """INSERT INTO audit_log
+                    (log_date, timestamp, server_host, username, host, connection_id, query_id, operation, dbname, query, retcode)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+            cur.executemany(sql, data)
+        print(f"✅ 匯入 {file_path} 完成，共 {len(data)} 筆")
+
+def get_log_files_for_month(config, month_str):
+    log_files = []
+    year, month = map(int, month_str.split('-'))
+    days_in_month = calendar.monthrange(year, month)[1]
+    for day in range(1, days_in_month + 1):
+        date_str = f"{year:04d}-{month:02d}-{day:02d}"
+        log_path = config.get_log_file_path(date_str)
+        if os.path.exists(log_path):
+            log_files.append((log_path, date_str))
+        elif os.path.exists(log_path + '.gz'):
+            log_files.append((log_path + '.gz', date_str))
+    return log_files
+
+def get_log_file_for_date(config, date_str):
+    log_path = config.get_log_file_path(date_str)
+    if os.path.exists(log_path):
+        return (log_path, date_str)
+    elif os.path.exists(log_path + '.gz'):
+        return (log_path + '.gz', date_str)
+    else:
         return None
 
-class SecurityAnalyzer:
-    def __init__(self, config: Config):
-        self.config = config
-        self.entries: List[AuditLogEntry] = []
-        self.analysis_results = {}
-    def load_log_file(self, file_path: str) -> bool:
-        if not os.path.exists(file_path):
-            print(f"❌ Log file does not exist: {file_path}")
-            return False
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = [l for l in f if l.strip()]
-        print(f"📁 Loading log file: {file_path}\n📄 Total lines: {len(lines)}")
-        for line in lines:
-            entry = AuditLogEntry(line)
-            if entry.timestamp:
-                self.entries.append(entry)
-        print(f"✅ Successfully parsed {len(self.entries)} log records")
-        return True
-    def analyze(self):
-        print("🔍 Starting security analysis...")
-        self.analysis_results['total_events'] = len(self.entries)
-        self.analysis_results['unique_users'] = len(set(e.username for e in self.entries))
-        self.analysis_results['unique_hosts'] = len(set(e.host for e in self.entries))
-        self._analyze_failed_logins()
-        self._analyze_suspicious_ips()
-        self._analyze_privileged_operations()
-        self._analyze_operation_stats()
-        self._analyze_error_codes()
-        self._analyze_after_hours_access()
-        self._analyze_privileged_user_logins()
-        print("✅ Security analysis completed")
-    def _analyze_failed_logins(self):
-        failed = [e for e in self.entries if e.is_failed_login()]
-        by_user = Counter(e.username for e in failed)
-        by_ip = Counter(e.host for e in failed)
-        threshold = self.config.failed_login_threshold
-        self.analysis_results['failed_logins'] = {
-            'total': len(failed),
-            'by_user': dict(by_user.most_common(10)),
-            'by_ip': dict(by_ip.most_common(10)),
-            'suspicious_users': {u: c for u, c in by_user.items() if c >= threshold},
-            'suspicious_ips': {ip: c for ip, c in by_ip.items() if c >= threshold},
-            'details': failed[:50]
-        }
-    def _analyze_suspicious_ips(self):
-        if not self.config.suspicious_ips:
-            self.analysis_results['suspicious_ip_activity'] = {'total': 0, 'details': []}
-            return
-        suspicious = [e for e in self.entries if self._is_suspicious_ip(e.host)]
-        self.analysis_results['suspicious_ip_activity'] = {
-            'total': len(suspicious),
-            'details': suspicious[:50]
-        }
-    def _is_suspicious_ip(self, ip: str) -> bool:
-        for s_ip in self.config.suspicious_ips:
-            if not s_ip: continue
-            if '/' in s_ip:
-                net = s_ip.split('/')[0]
-                if ip.startswith(net.rsplit('.', 1)[0]):
-                    return True
-            elif ip == s_ip:
-                return True
-        return False
-    def _analyze_privileged_operations(self):
-        priv_ops = [e for e in self.entries if e.is_privileged_operation()]
-        by_user = Counter(e.username for e in priv_ops)
-        self.analysis_results['privileged_operations'] = {
-            'total': len(priv_ops),
-            'by_user': dict(by_user.most_common(10)),
-            'details': priv_ops[:50]
-        }
-    def _analyze_operation_stats(self):
-        op_counts = Counter(e.operation for e in self.entries)
-        self.analysis_results['operation_stats'] = dict(op_counts.most_common())
-    def _analyze_error_codes(self):
-        errors = [e for e in self.entries if e.retcode != 0]
-        codes = Counter(e.retcode for e in errors)
-        self.analysis_results['error_analysis'] = {
-            'total_errors': len(errors),
-            'error_codes': dict(codes.most_common()),
-            'details': errors[:50]
-        }
-    def _analyze_after_hours_access(self):
-        users = self.config.after_hours_users
-        wh_start, wh_end = self.config.work_hour_start, self.config.work_hour_end
-        after_hours = []
-        for e in self.entries:
-            if e.username in users:
-                dt = e.get_datetime()
-                if dt:
-                    if dt.weekday() >= 5 or not (wh_start <= dt.hour < wh_end):
-                        after_hours.append(e)
-        self.analysis_results['after_hours_access'] = {
-            'total': len(after_hours),
-            'details': after_hours[:50]
-        }
-    def _analyze_privileged_user_logins(self):
-        users = self.config.privileged_users
-        priv_logins = [e for e in self.entries if e.operation == 'CONNECT' and e.username in users]
-        by_user = Counter(e.username for e in priv_logins)
-        self.analysis_results['privileged_user_logins'] = {
-            'total': len(priv_logins),
-            'by_user': dict(by_user.most_common()),
-            'details': priv_logins[:50]
+# ========== 分析查詢 ==========
+
+def analyze_summary(conn, date_filter, date_filter_value):
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute("SELECT COUNT(*), COUNT(DISTINCT username), COUNT(DISTINCT host) FROM audit_log WHERE " + date_filter, params)
+        total_events, unique_users, unique_hosts = cur.fetchone()
+        return {
+            'total_events': total_events,
+            'unique_users': unique_users,
+            'unique_hosts': unique_hosts
         }
 
-class ReportGenerator:
-    def __init__(self, config: Config, analysis_results: dict):
-        self.config = config
-        self.analysis_results = analysis_results
-        self.timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    def generate_csv_report(self, output_dir: str) -> str:
-        os.makedirs(output_dir, exist_ok=True)
-        csv_file = os.path.join(output_dir, f'mysql_audit_analysis_{self.timestamp}.csv')
-        w = lambda row: writer.writerow(row)
-        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            w([f'{self.config.report_title} - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'])
-            w([]); w(['=== Basic Statistics ==='])
-            w(['Total Events', self.analysis_results.get('total_events', 0)])
-            w(['Unique Users', self.analysis_results.get('unique_users', 0)])
-            w(['Unique Hosts', self.analysis_results.get('unique_hosts', 0)])
+def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5):
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value + (threshold,)
+            params2 = date_filter_value
+        else:
+            params = (date_filter_value, threshold)
+            params2 = (date_filter_value,)
+        cur.execute(
+            f"""SELECT username, COUNT(*) as fail_count
+                FROM audit_log
+                WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}
+                GROUP BY username
+                HAVING fail_count >= %s
+                ORDER BY fail_count DESC
+            """,
+            params
+        )
+        by_user = cur.fetchall()
+        cur.execute(
+            f"""SELECT host, COUNT(*) as fail_count
+                FROM audit_log
+                WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}
+                GROUP BY host
+                HAVING fail_count >= %s
+                ORDER BY fail_count DESC
+            """,
+            params
+        )
+        by_ip = cur.fetchall()
+        cur.execute(
+            f"SELECT COUNT(*) FROM audit_log WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}",
+            params2
+        )
+        total = cur.fetchone()[0]
+        return {
+            'total': total,
+            'by_user': by_user,
+            'by_ip': by_ip
+        }
+
+def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords):
+    like_clauses = " OR ".join(["UPPER(query) LIKE %s" for _ in keywords])
+    like_params = [f"%{k.upper()}%" for k in keywords]
+    if isinstance(date_filter_value, tuple):
+        params = like_params + list(date_filter_value)
+    else:
+        params = like_params + [date_filter_value]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""SELECT username, COUNT(*) as cnt
+                FROM audit_log
+                WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}
+                GROUP BY username
+                ORDER BY cnt DESC
+            """,
+            params
+        )
+        by_user = cur.fetchall()
+        cur.execute(
+            f"""SELECT COUNT(*) FROM audit_log
+                WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}
+            """,
+            params
+        )
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"""SELECT username, query, timestamp
+                FROM audit_log
+                WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}
+                ORDER BY timestamp DESC
+            """,
+            params
+        )
+        details = cur.fetchall()
+        return {
+            'total': total,
+            'by_user': by_user,
+            'details': details
+        }
+
+def analyze_operation_stats(conn, date_filter, date_filter_value):
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT operation, COUNT(*) as cnt
+                FROM audit_log
+                WHERE {date_filter}
+                GROUP BY operation
+                ORDER BY cnt DESC
+            """,
+            params
+        )
+        return cur.fetchall()
+
+def analyze_error_codes(conn, date_filter, date_filter_value):
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT retcode, COUNT(*) as cnt
+                FROM audit_log
+                WHERE retcode!=0 AND {date_filter}
+                GROUP BY retcode
+                ORDER BY cnt DESC
+            """,
+            params
+        )
+        error_codes = cur.fetchall()
+        cur.execute(
+            f"SELECT COUNT(*) FROM audit_log WHERE retcode!=0 AND {date_filter}",
+            params
+        )
+        total_errors = cur.fetchone()[0]
+        return {
+            'total_errors': total_errors,
+            'error_codes': error_codes
+        }
+
+def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_start, wh_end):
+    if not users:
+        return {'total': 0, 'details': []}
+    user_list = ','.join(["'%s'" % u for u in users])
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT username, host, operation, timestamp
+                FROM audit_log
+                WHERE username IN ({user_list}) AND {date_filter}
+            """,
+            params
+        )
+        rows = cur.fetchall()
+        after_hours = []
+        for username, host, operation, ts in rows:
+            try:
+                dt = datetime.strptime(ts, "%Y%m%d %H:%M:%S")
+            except:
+                continue
+            if dt.weekday() >= 5 or not (wh_start <= dt.hour < wh_end):
+                after_hours.append((username, host, operation, dt.strftime('%Y-%m-%d %H:%M:%S')))
+        return {'total': len(after_hours), 'details': after_hours[:50]}
+
+def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users):
+    if not users:
+        return {'total': 0, 'by_user': [], 'details': []}
+    user_list = ','.join(["'%s'" % u for u in users])
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT username, COUNT(*) as cnt
+                FROM audit_log
+                WHERE operation='CONNECT' AND username IN ({user_list}) AND {date_filter}
+                GROUP BY username
+                ORDER BY cnt DESC
+            """,
+            params
+        )
+        by_user = cur.fetchall()
+        cur.execute(
+            f"""SELECT username, host, timestamp
+                FROM audit_log
+                WHERE operation='CONNECT' AND username IN ({user_list}) AND {date_filter}
+                ORDER BY timestamp DESC
+            """,
+            params
+        )
+        details = cur.fetchall()
+        cur.execute(
+            f"""SELECT COUNT(*) FROM audit_log
+                WHERE operation='CONNECT' AND username IN ({user_list}) AND {date_filter}
+            """,
+            params
+        )
+        total = cur.fetchone()[0]
+        return {'total': total, 'by_user': by_user, 'details': details}
+
+def analyze_non_whitelisted_ips(conn, date_filter, date_filter_value, allowed_ips):
+    if not allowed_ips:
+        return {'total': 0, 'by_ip': [], 'details': []}
+    ip_list = ','.join(["'%s'" % ip for ip in allowed_ips])
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT host, COUNT(*) as cnt
+                FROM audit_log
+                WHERE host NOT IN ({ip_list}) AND {date_filter}
+                GROUP BY host
+                ORDER BY cnt DESC
+            """,
+            params
+        )
+        by_ip = cur.fetchall()
+        cur.execute(
+            f"""SELECT username, host, operation, timestamp
+                FROM audit_log
+                WHERE host NOT IN ({ip_list}) AND {date_filter}
+                ORDER BY timestamp DESC
+            """,
+            params
+        )
+        details = cur.fetchall()
+        cur.execute(
+            f"""SELECT COUNT(*) FROM audit_log
+                WHERE host NOT IN ({ip_list}) AND {date_filter}
+            """,
+            params
+        )
+        total = cur.fetchone()[0]
+        return {'total': total, 'by_ip': by_ip, 'details': details}
+
+# ========== 報表產生（CSV） ==========
+
+def generate_csv_report(output_dir, report_title, summary, failed, priv_ops, priv_user_logins, op_stats, err, after_hours, non_whitelisted, period_label):
+    os.makedirs(output_dir, exist_ok=True)
+    csv_file = os.path.join(output_dir, f'mysql_audit_analysis_{period_label}.csv')
+    w = lambda row: writer.writerow(row)
+    with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        w([f'{report_title} - {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'])
+        w([]); w(['=== Basic Statistics ==='])
+        w(['Total Events', summary['total_events']])
+        w(['Unique Users', summary['unique_users']])
+        w(['Unique Hosts', summary['unique_hosts']])
+        w([])
+        w(['=== Failed Login Analysis ==='])
+        w(['Total Failed Logins', failed['total']]); w([])
+        if failed['by_user']:
+            w(['Suspicious Users (Above Threshold)'])
+            w(['Username', 'Failed Count'])
+            for row in failed['by_user']: w(list(row))
             w([])
-            # Failed login analysis
-            failed = self.analysis_results.get('failed_logins', {})
-            w(['=== Failed Login Analysis ==='])
-            w(['Total Failed Logins', failed.get('total', 0)]); w([])
-            if failed.get('suspicious_users'):
-                w(['Suspicious Users (Above Threshold)'])
-                w(['Username', 'Failed Count'])
-                for user, count in failed['suspicious_users'].items(): w([user, count])
-                w([])
-            if failed.get('suspicious_ips'):
-                w(['Suspicious IPs (Above Threshold)'])
-                w(['IP Address', 'Failed Count'])
-                for ip, count in failed['suspicious_ips'].items(): w([ip, count])
-                w([])
-            # Privileged operations analysis
-            priv_ops = self.analysis_results.get('privileged_operations', {})
-            w(['=== Privileged Operations Analysis ==='])
-            w(['Total Privileged Operations', priv_ops.get('total', 0)]); w([])
-            if priv_ops.get('by_user'):
-                w(['By User Statistics']); w(['Username', 'Operation Count'])
-                for user, count in priv_ops['by_user'].items(): w([user, count])
-                w([])
-            # Privileged user login analysis
-            priv_user_logins = self.analysis_results.get('privileged_user_logins', {})
-            w(['=== Privileged Account Login Analysis ==='])
-            w(['Total Privileged Account Logins', priv_user_logins.get('total', 0)])
-            if priv_user_logins.get('by_user'):
-                w(['Username', 'Login Count'])
-                for user, count in priv_user_logins['by_user'].items(): w([user, count])
+        if failed['by_ip']:
+            w(['Suspicious IPs (Above Threshold)'])
+            w(['IP Address', 'Failed Count'])
+            for row in failed['by_ip']: w(list(row))
             w([])
-            if priv_user_logins.get('details'):
-                w(['Detailed Privileged Account Login Records'])
-                w(['Username', 'Host', 'Timestamp'])
-                for e in priv_user_logins['details']:
-                    dt = e.get_datetime()
-                    w([e.username, e.host, dt.strftime('%Y-%m-%d %H:%M:%S') if dt else e.timestamp])
-                w([])
-            # Operation statistics
-            w(['=== Operation Type Statistics ===']); w(['Operation Type', 'Count'])
-            for op, c in self.analysis_results.get('operation_stats', {}).items(): w([op, c])
+        w(['=== Privileged Operations Analysis ==='])
+        w(['Total Privileged Operations', priv_ops['total']]); w([])
+        if priv_ops['by_user']:
+            w(['By User Statistics']); w(['Username', 'Operation Count'])
+            for row in priv_ops['by_user']: w(list(row))
             w([])
-            # Error analysis
-            err = self.analysis_results.get('error_analysis', {})
-            w(['=== Error Analysis ===']); w(['Total Errors', err.get('total_errors', 0)]); w([])
-            if err.get('error_codes'):
-                w(['Error Code Statistics']); w(['Error Code', 'Count'])
-                for code, count in err['error_codes'].items(): w([code, count])
+        if priv_ops.get('details'):
+            w(['Detailed Privileged Operations (SQL)'])
+            w(['Username', 'SQL', 'Timestamp'])
+            for row in priv_ops['details']:
+                w(list(row))
             w([])
-            # After-hours access
-            after_hours = self.analysis_results.get('after_hours_access', {})
-            w(['=== After-hours Access (Specify account) ==='])
-            w(['Total After-hours Access', after_hours.get('total', 0)])
-            if after_hours.get('details'):
-                w(['Username', 'Host', 'Operation', 'Time'])
-                for e in after_hours['details']:
-                    dt = e.get_datetime()
-                    w([e.username, e.host, e.operation, dt.strftime('%Y-%m-%d %H:%M:%S') if dt else e.timestamp])
+        w(['=== Privileged Account Login Analysis ==='])
+        w(['Total Privileged Account Logins', priv_user_logins['total']])
+        if priv_user_logins['by_user']:
+            w(['Username', 'Login Count'])
+            for row in priv_user_logins['by_user']: w(list(row))
+        w([])
+        if priv_user_logins['details']:
+            w(['Detailed Privileged Account Login Records'])
+            w(['Username', 'Host', 'Timestamp'])
+            for row in priv_user_logins['details']:
+                w(list(row))
             w([])
-        print(f"✅ CSV report generated: {csv_file}")
-        return csv_file
-    def generate_pdf_report(self, output_dir: str) -> str:
-        if not REPORTLAB_AVAILABLE:
-            print("❌ ReportLab not installed, cannot generate PDF report\nPlease run: pip install reportlab")
-            return None
-        os.makedirs(output_dir, exist_ok=True)
-        pdf_file = os.path.join(output_dir, f'mysql_audit_analysis_{self.timestamp}.pdf')
-        doc = SimpleDocTemplate(pdf_file, pagesize=A4)
-        styles = getSampleStyleSheet()
-        story = []
-        def add_table(data, font=12):
-            table = Table(data)
+        w(['=== Operation Type Statistics ===']); w(['Operation Type', 'Count'])
+        for row in op_stats: w(list(row))
+        w([])
+        w(['=== Error Analysis ===']); w(['Total Errors', err['total_errors']]); w([])
+        if err['error_codes']:
+            w(['Error Code Statistics']); w(['Error Code', 'Count'])
+            for row in err['error_codes']: w(list(row))
+        w([])
+        w(['=== After-hours Access (Specify account) ==='])
+        w(['Total After-hours Access', after_hours['total']])
+        if after_hours['details']:
+            w(['Username', 'Host', 'Operation', 'Time'])
+            for row in after_hours['details']:
+                w(list(row))
+        w([])
+        w(['=== Non-whitelisted IP Access Analysis ==='])
+        w(['Total Events from Non-whitelisted IPs', non_whitelisted['total']])
+        if non_whitelisted['by_ip']:
+            w(['Non-whitelisted IPs'])
+            w(['IP Address', 'Event Count'])
+            for row in non_whitelisted['by_ip']: w(list(row))
+            w([])
+        if non_whitelisted['details']:
+            w(['Details (Username, Host, Operation, Time)'])
+            for row in non_whitelisted['details']:
+                w(list(row))
+        w([])
+    print(f"✅ CSV report generated: {csv_file}")
+    return csv_file
+
+# ========== 報表產生（PDF） ==========
+
+def generate_pdf_report(output_dir, report_title, summary, failed, priv_ops, priv_user_logins, op_stats, err, after_hours, non_whitelisted, period_label):
+    if not REPORTLAB_AVAILABLE:
+        print("❌ ReportLab not installed, PDF report cannot be generated.")
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    pdf_file = os.path.join(output_dir, f'mysql_audit_analysis_{period_label}.pdf')
+    doc = SimpleDocTemplate(pdf_file, pagesize=A4)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph(f"<b>{report_title}</b>", styles['Title']))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+    story.append(Spacer(1, 8))
+
+    def add_table(title, data, colnames):
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"<b>{title}</b>", styles['Heading3']))
+        if not data:
+            story.append(Paragraph("(No data)", styles['Normal']))
+        else:
+            table = Table([colnames] + list(data), hAlign='LEFT')
             table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), font),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
             ]))
             story.append(table)
-        title_style = ParagraphStyle(
-            'CustomTitle', parent=styles['Heading1'],
-            fontSize=16, spaceAfter=30, alignment=1
-        )
-        story.append(Paragraph(self.config.report_title, title_style))
-        story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-        story.append(Spacer(1, 20))
-        story.append(Paragraph("Basic Statistics", styles['Heading2']))
-        add_table([
-            ['Total Events', str(self.analysis_results.get('total_events', 0))],
-            ['Unique Users', str(self.analysis_results.get('unique_users', 0))],
-            ['Unique Hosts', str(self.analysis_results.get('unique_hosts', 0))]
-        ], 14)
-        story.append(Spacer(1, 20))
-        # Security warnings
-        story.append(Paragraph("Security Warnings", styles['Heading2']))
-        failed = self.analysis_results.get('failed_logins', {})
-        if failed.get('suspicious_users') or failed.get('suspicious_ips'):
-            if failed.get('suspicious_users'):
-                story.append(Paragraph("⚠️ Suspicious user activity detected:", styles['Normal']))
-                for user, count in failed['suspicious_users'].items():
-                    story.append(Paragraph(f"• {user}: {count} failed logins", styles['Normal']))
-                story.append(Spacer(1, 10))
-            if failed.get('suspicious_ips'):
-                story.append(Paragraph("⚠️ Suspicious IP activity detected:", styles['Normal']))
-                for ip, count in failed['suspicious_ips'].items():
-                    story.append(Paragraph(f"• {ip}: {count} failed logins", styles['Normal']))
-        else:
-            story.append(Paragraph("✅ No obvious security threats detected", styles['Normal']))
-        story.append(Spacer(1, 20))
-        # Operation statistics
-        story.append(Paragraph("Operation Type Statistics", styles['Heading2']))
-        op_data = [['Operation Type', 'Count']]
-        for op, c in list(self.analysis_results.get('operation_stats', {}).items())[:10]:
-            op_data.append([op, str(c)])
-        if len(op_data) > 1: add_table(op_data)
-        story.append(Spacer(1, 20))
-        # Privileged user login analysis
-        story.append(Paragraph("Privileged Account Login Analysis", styles['Heading2']))
-        priv_user_logins = self.analysis_results.get('privileged_user_logins', {})
-        story.append(Paragraph(f"Total privileged account logins: {priv_user_logins.get('total', 0)}", styles['Normal']))
-        if priv_user_logins.get('by_user'):
-            data = [['Username', 'Login Count']]
-            for user, count in priv_user_logins['by_user'].items():
-                data.append([user, str(count)])
-            add_table(data, 10)
-        story.append(Spacer(1, 20))
-        if priv_user_logins.get('details'):
-            story.append(Paragraph("Detailed Privileged Account Login Records (Top 50)", styles['Heading3']))
-            data = [['Username', 'Host', 'Timestamp']]
-            for e in priv_user_logins['details']:
-                dt = e.get_datetime()
-                data.append([e.username, e.host, dt.strftime('%Y-%m-%d %H:%M:%S') if dt else e.timestamp])
-            add_table(data, 10)
-            story.append(Spacer(1, 20))
-        # After-hours access
-        story.append(Paragraph("After-hours Access (Specify account)", styles['Heading2']))
-        after_hours = self.analysis_results.get('after_hours_access', {})
-        story.append(Paragraph(f"Total after-hours access: {after_hours.get('total', 0)}", styles['Normal']))
-        if after_hours.get('details'):
-            data = [['Username', 'Host', 'Operation', 'Time']]
-            for e in after_hours['details']:
-                dt = e.get_datetime()
-                data.append([e.username, e.host, e.operation, dt.strftime('%Y-%m-%d %H:%M:%S') if dt else e.timestamp])
-            add_table(data, 10)
-        story.append(Spacer(1, 20))
-        doc.build(story)
-        print(f"✅ PDF report generated: {pdf_file}")
-        return pdf_file
 
-def send_email_with_attachment(config: Config, attachment_path: str, body: str = ""):
-    if not config.smtp_host or not config.mail_to:
-        print("❌ SMTP 設定不完整，無法發送郵件")
-        return False
+    story.append(Paragraph("<b>=== Basic Statistics ===</b>", styles['Heading2']))
+    story.append(Paragraph(f"Total Events: {summary['total_events']}<br />"
+                        f"Unique Users: {summary['unique_users']}<br />"
+                        f"Unique Hosts: {summary['unique_hosts']}", styles['Normal']))
+
+    add_table("Suspicious Users (Failed Logins)", failed['by_user'], ['Username', 'Failed Count'])
+    add_table("Suspicious IPs (Failed Logins)", failed['by_ip'], ['IP Address', 'Failed Count'])
+    add_table("Privileged Operations by User", priv_ops['by_user'], ['Username', 'Operation Count'])
+    add_table("Detailed Privileged Operations (SQL)", priv_ops.get('details', []), ['Username', 'SQL', 'Timestamp'])
+    add_table("Privileged Account Login Statistics", priv_user_logins['by_user'], ['Username', 'Login Count'])
+    add_table("Privileged Account Login Details", priv_user_logins['details'], ['Username', 'IP Address', 'Timestamp'])
+    add_table("Operation Type Statistics", op_stats, ['Operation', 'Count'])
+    add_table("Error Code Statistics", err['error_codes'], ['Error Code', 'Count'])
+    add_table("After-hours Access (Specify account)", after_hours['details'], ['Username', 'IP Address', 'Operation', 'Timestamp'])
+    add_table("Non-whitelisted IPs", non_whitelisted['by_ip'], ['IP Address', 'Event Count'])
+    add_table("Non-whitelisted IP Access Details", non_whitelisted['details'], ['Username', 'IP Address', 'Operation', 'Timestamp'])
+
+    doc.build(story)
+    print(f"✅ PDF report generated: {pdf_file}")
+    return pdf_file
+
+# ========== 郵件寄送 ==========
+
+def send_email_with_attachment(config: Config, subject, body, attachment_path):
+    if not (config.smtp_server and config.mail_from and config.mail_to):
+        print("❌ SMTP 或收件人設定不完整，無法寄信。")
+        return
     msg = EmailMessage()
-    msg['Subject'] = getattr(config, 'mail_subject', 'MySQL Audit Log Report')
-    msg['From'] = formataddr((getattr(config, 'company_name', ''), getattr(config, 'mail_from', '')))
-    msg['To'] = ", ".join(getattr(config, 'mail_to', []))
-    msg.set_content(body or f'報表使用昨日紀錄生成，詳見附件：{os.path.basename(attachment_path)}')
+    msg['Subject'] = subject
+    msg['From'] = config.mail_from
+    msg['To'] = ', '.join(config.mail_to)
+    msg.set_content(body)
     with open(attachment_path, 'rb') as f:
         file_data = f.read()
         file_name = os.path.basename(attachment_path)
-        msg.add_attachment(file_data, maintype='application', subtype='pdf', filename=file_name)
+    maintype, subtype = ('application', 'pdf') if file_name.endswith('.pdf') else ('application', 'octet-stream')
+    msg.add_attachment(file_data, maintype=maintype, subtype=subtype, filename=file_name)
     try:
-        with smtplib.SMTP(getattr(config, 'smtp_host', ''), getattr(config, 'smtp_port', 25)) as smtp:
-            smtp.send_message(msg)
-        print(f"✅ 郵件已發送至 {getattr(config, 'mail_to', [])}")
-        return True
+        with smtplib.SMTP(config.smtp_server, config.smtp_port) as server:
+            server.send_message(msg)
+        print(f"📧 郵件已寄出至: {', '.join(config.mail_to)}")
     except Exception as e:
-        print(f"❌ 發送郵件失敗: {e}")
-        return False
+        print(f"❌ 郵件寄送失敗: {e}")
+
+# ========== 主程式 ==========
 
 def main():
-    parser = argparse.ArgumentParser(description='MySQL Audit Log Security Analyzer')
-    parser.add_argument('--date', help='Analyze logs for specific date (format: YYYY-MM-DD, default: today)')
+    parser = argparse.ArgumentParser(description='MySQL Audit Log Security Analyzer (MySQL backend)')
+    parser.add_argument('--import-date', help='Import logs for specific date (format: YYYY-MM-DD)')
+    parser.add_argument('--import-month', help='Import logs for specific month (format: YYYY-MM)')
+    parser.add_argument('--analyze-date', help='Analyze logs for specific date (format: YYYY-MM-DD)')
+    parser.add_argument('--analyze-month', help='Analyze logs for specific month (format: YYYY-MM)')
     parser.add_argument('--output-dir', help='Output directory')
     parser.add_argument('--csv-only', action='store_true', help='Generate CSV report only')
-    parser.add_argument('--pdf-only', action='store_true', help='Generate PDF report only')
-    parser.add_argument('--show-config', action='store_true', help='Show current configuration')
-    parser.add_argument('--env-file', help='Specify environment file path')
+    parser.add_argument('--show-env', action='store_true', help='Show all env/config parameters and exit')
     args = parser.parse_args()
-    config = Config(args.env_file)
-    if args.show_config:
-        config.show_config()
+    config = Config()
+
+    # 顯示所有 env 設定
+    if args.show_env:
+        print("🔎 目前抓到的 .env/環境變數參數如下：\n")
+        for k, v in config.as_dict().items():
+            print(f"{k}: {v}")
         return
-    date_str = args.date if args.date else datetime.now().strftime('%Y-%m-%d')
-    print(f"📅 Analysis date: {date_str}")
-    log_file_path = config.get_log_file_path(date_str)
-    analyzer = SecurityAnalyzer(config)
-    if not analyzer.load_log_file(log_file_path):
+
+    conn = get_db_conn(config)
+
+    # 匯入日誌
+    if args.import_date:
+        log = get_log_file_for_date(config, args.import_date)
+        if log:
+            import_log_file_to_db(log[0], log[1], conn)
+        else:
+            print(f"❌ No log file found for {args.import_date}")
         return
-    analyzer.analyze()
+    elif args.import_month:
+        logs = get_log_files_for_month(config, args.import_month)
+        if not logs:
+            print(f"❌ No log files found for {args.import_month}")
+            return
+        for log_path, log_date in logs:
+            import_log_file_to_db(log_path, log_date, conn)
+        return
+
+    # 分析
+    if args.analyze_month:
+        # 修正：正確支援 DATE 型態的 log_date
+        year, month = map(int, args.analyze_month.split('-'))
+        days_in_month = calendar.monthrange(year, month)[1]
+        date_start = f"{year:04d}-{month:02d}-01"
+        date_end = f"{year:04d}-{month:02d}-{days_in_month:02d}"
+        period_label = args.analyze_month.replace('-', '')
+        date_filter = "log_date BETWEEN %s AND %s"
+        date_filter_value = (date_start, date_end)
+    else:
+        date_str = args.analyze_date if args.analyze_date else datetime.now().strftime('%Y-%m-%d')
+        period_label = date_str.replace('-', '')
+        date_filter = "log_date = %s"
+        date_filter_value = date_str
+
+    summary = analyze_summary(conn, date_filter, date_filter_value)
+    failed = analyze_failed_logins(conn, date_filter, date_filter_value, config.failed_login_threshold)
+    priv_ops = analyze_privileged_operations(conn, date_filter, date_filter_value, config.privileged_keywords)
+    op_stats = analyze_operation_stats(conn, date_filter, date_filter_value)
+    err = analyze_error_codes(conn, date_filter, date_filter_value)
+    after_hours = analyze_after_hours_access(conn, date_filter, date_filter_value, config.after_hours_users, config.work_hour_start, config.work_hour_end)
+    priv_user_logins = analyze_privileged_user_logins(conn, date_filter, date_filter_value, config.privileged_users)
+    non_whitelisted = analyze_non_whitelisted_ips(conn, date_filter, date_filter_value, config.allowed_ips)
+
     output_dir = args.output_dir or config.output_dir
-    report_generator = ReportGenerator(config, analyzer.analysis_results)
-    generated_files = []
-    generate_csv = config.generate_csv if not args.pdf_only else False
-    generate_pdf = config.generate_pdf if not args.csv_only else False
-    if generate_csv:
-        csv_file = report_generator.generate_csv_report(output_dir)
-        if csv_file: generated_files.append(csv_file)
-    if generate_pdf:
-        pdf_file = report_generator.generate_pdf_report(output_dir)
-        if pdf_file:
-            generated_files.append(pdf_file)
-            if config.send_email:
-                send_email_with_attachment(config, pdf_file)
-            else:
-                print("✉️  SEND_EMAIL 設定為 false，未寄出郵件")
+    csv_file = None
+    pdf_file = None
+    if config.generate_csv:
+        csv_file = generate_csv_report(output_dir, config.report_title, summary, failed, priv_ops, priv_user_logins, op_stats, err, after_hours, non_whitelisted, period_label)
+    if config.generate_pdf and not args.csv_only:
+        pdf_file = generate_pdf_report(output_dir, config.report_title, summary, failed, priv_ops, priv_user_logins, op_stats, err, after_hours, non_whitelisted, period_label)
+        if pdf_file and config.send_email:
+            send_email_with_attachment(
+                config,
+                subject=f"{config.report_title} ({period_label})",
+                body=f"附件為 {config.company_name} MySQL 稽核日誌安全分析報告。",
+                attachment_path=pdf_file
+            )
+        elif pdf_file:
+            print("✉️  SEND_EMAIL=false，未進行郵件寄送。")
+    elif args.csv_only:
+        print("✉️  已指定 --csv-only，不產生PDF亦不寄信。")
+    else:
+        print("✉️  未產生PDF，不進行寄信。")
+
     print("\n" + "="*50)
     print("📊 Analysis Result Summary")
     print("="*50)
-    print(f"Total Events: {analyzer.analysis_results.get('total_events', 0)}")
-    print(f"Failed Logins: {analyzer.analysis_results.get('failed_logins', {}).get('total', 0)}")
-    print(f"Privileged Operations: {analyzer.analysis_results.get('privileged_operations', {}).get('total', 0)}")
-    print(f"Privileged Account Logins: {analyzer.analysis_results.get('privileged_user_logins', {}).get('total', 0)}")
-    print(f"Error Events: {analyzer.analysis_results.get('error_analysis', {}).get('total_errors', 0)}")
-    failed_logins = analyzer.analysis_results.get('failed_logins', {})
-    if failed_logins.get('suspicious_users'):
-        print(f"\n⚠️  Suspicious Users: {len(failed_logins['suspicious_users'])}")
-    if failed_logins.get('suspicious_ips'):
-        print(f"⚠️  Suspicious IPs: {len(failed_logins['suspicious_ips'])}")
-    after_hours = analyzer.analysis_results.get('after_hours_access', {})
-    if after_hours.get('total', 0):
-        print(f"⚠️  After-hours access (Specify account): {after_hours.get('total', 0)}")
-    print(f"\n📁 Generated report files:")
-    for file_path in generated_files:
-        print(f"   • {file_path}")
+    print(f"Total Events: {summary['total_events']}")
+    print(f"Failed Logins: {failed['total']}")
+    print(f"Privileged Operations: {priv_ops['total']}")
+    print(f"Privileged Account Logins: {priv_user_logins['total']}")
+    print(f"Error Events: {err['total_errors']}")
+    print(f"Non-whitelisted IP Events: {non_whitelisted['total']}")
+    if failed['by_user']:
+        print(f"\n⚠️  Suspicious Users: {len(failed['by_user'])}")
+    if failed['by_ip']:
+        print(f"⚠️  Suspicious IPs: {len(failed['by_ip'])}")
+    if non_whitelisted['by_ip']:
+        print(f"⚠️  Non-whitelisted IPs: {len(non_whitelisted['by_ip'])}")
+    if after_hours['total']:
+        print(f"⚠️  After-hours access (Specify account): {after_hours['total']}")
 
 if __name__ == "__main__":
     main()
