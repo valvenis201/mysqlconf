@@ -1072,22 +1072,25 @@ def main():
     print(f"\n🔍 開始進行安全分析...")
     analysis_start_time = datetime.now()
     
+  # 以 timestamp 欄位為主進行查詢
     if args.analyze_month:
-        # 修正：正確支援 DATE 型態的 log_date
         year, month = map(int, args.analyze_month.split('-'))
         days_in_month = calendar.monthrange(year, month)[1]
-        date_start = f"{year:04d}-{month:02d}-01"
-        date_end = f"{year:04d}-{month:02d}-{days_in_month:02d}"
+        ts_start = f"{year:04d}{month:02d}01 00:00:00"
+        ts_end = f"{year:04d}{month:02d}{days_in_month:02d} 23:59:59"
         period_label = args.analyze_month.replace('-', '')
-        date_filter = "log_date BETWEEN %s AND %s"
-        date_filter_value = (date_start, date_end)
-        print(f"📊 分析期間: {args.analyze_month} ({date_start} 到 {date_end})")
+        date_filter = "timestamp BETWEEN %s AND %s"
+        date_filter_value = (ts_start, ts_end)
+        print(f"📊 分析期間: {args.analyze_month} ({ts_start} 到 {ts_end})")
     else:
         date_str = args.analyze_date if args.analyze_date else datetime.now().strftime('%Y-%m-%d')
+        y, m, d = map(int, date_str.split('-'))
+        ts_start = f"{y:04d}{m:02d}{d:02d} 00:00:00"
+        ts_end = f"{y:04d}{m:02d}{d:02d} 23:59:59"
         period_label = date_str.replace('-', '')
-        date_filter = "log_date = %s"
-        date_filter_value = date_str
-        print(f"📊 分析日期: {date_str}")
+        date_filter = "timestamp BETWEEN %s AND %s"
+        date_filter_value = (ts_start, ts_end)
+        print(f"📊 分析日期: {date_str} ({ts_start} 到 {ts_end})")
 
     # 定義所有分析功能
     analysis_functions = [
