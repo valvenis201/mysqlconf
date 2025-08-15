@@ -8,7 +8,8 @@ import pymysql
 import smtplib
 from email.message import EmailMessage
 from contextlib import contextmanager
-from pymysql.pool import Pool
+import queue
+import threading
 
 # 全域資源監控變數
 _resource_monitor = None
@@ -47,6 +48,66 @@ class ResourceMonitor:
             time.sleep(0.5)  # 給系統時間釋放記憶體
             return True
         return False
+
+class SimpleConnectionPool:
+    """簡單的 MySQL 連接池實現"""
+    def __init__(self, host, port, user, password, database, charset='utf8mb4', 
+                 max_connections=10, **kwargs):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+        self.charset = charset
+        self.max_connections = max_connections
+        self.kwargs = kwargs
+        self._pool = queue.Queue(maxsize=max_connections)
+        self._lock = threading.Lock()
+        self._created_connections = 0
+        
+    def get_connection(self):
+        """從連接池獲取連接"""
+        try:
+            # 嘗試從池中獲取現有連接
+            conn = self._pool.get_nowait()
+            # 檢查連接是否仍然有效
+            try:
+                conn.ping(reconnect=True)
+                return conn
+            except:
+                # 連接已失效，創建新連接
+                pass
+        except queue.Empty:
+            pass
+        
+        # 創建新連接
+        with self._lock:
+            if self._created_connections < self.max_connections:
+                conn = pymysql.connect(
+                    host=self.host,
+                    port=self.port,
+                    user=self.user,
+                    password=self.password,
+                    database=self.database,
+                    charset=self.charset,
+                    autocommit=True,
+                    local_infile=True,
+                    **self.kwargs
+                )
+                self._created_connections += 1
+                return conn
+        
+        # 池已滿，等待可用連接
+        return self._pool.get(timeout=30)
+    
+    def release_connection(self, conn):
+        """釋放連接回池中"""
+        if conn and conn.open:
+            try:
+                self._pool.put_nowait(conn)
+            except queue.Full:
+                # 池已滿，關閉連接
+                conn.close()
 
 def init_resource_monitoring(config: Config):
     """初始化資源監控"""
@@ -173,16 +234,13 @@ def init_connection_pool(config: Config):
     """
     global _connection_pool
     if _connection_pool is None:
-        _connection_pool = Pool(
+        _connection_pool = SimpleConnectionPool(
             host=config.mysql_host,
             port=config.mysql_port,
             user=config.mysql_user,
             password=config.mysql_password,
             database=config.mysql_db,
             charset='utf8mb4',
-            autocommit=True,
-            local_infile=True,
-            # 連線池設定
             max_connections=config.db_pool_size + config.db_max_overflow,
             # 連線超時設定
             connect_timeout=30,
@@ -211,7 +269,7 @@ def get_db_conn(config: Config):
         raise e
     finally:
         if conn:
-            conn.close()
+            _connection_pool.release_connection(conn)
 
 def get_legacy_db_conn(config: Config):
     """
