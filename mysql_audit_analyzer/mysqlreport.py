@@ -308,14 +308,18 @@ def get_simple_db_conn(config: Config):
         cursorclass=pymysql.cursors.DictCursor  # 使用字典游標便於結果處理
     )
 
-def execute_simple_query(conn, query, params=None):
+def execute_simple_query(conn, query, params=None, max_rows=10000):
     """
     執行簡單查詢用於分析 (不使用複雜的重試和資源監控)
     """
     try:
         with conn.cursor() as cur:
             cur.execute(query, params)
-            return cur.fetchall()
+            # 限制結果數量以防止記憶體問題
+            if "SELECT COUNT" in query.upper() or "LIMIT" in query.upper():
+                return cur.fetchall()
+            else:
+                return cur.fetchmany(max_rows)
     except Exception as e:
         print(f"❌ 查詢執行失敗: {e}")
         return []
@@ -757,15 +761,15 @@ def analyze_summary(conn, date_filter, date_filter_value, config=None, use_simpl
     else:
         params = (date_filter_value,)
     
-    query = f"SELECT COUNT(*), COUNT(DISTINCT username), COUNT(DISTINCT host) FROM audit_log WHERE {date_filter}"
-    result = execute_query_with_retry(conn, query, params, config, 'fetchone')
+    query = f"SELECT COUNT(*) as total_events, COUNT(DISTINCT username) as unique_users, COUNT(DISTINCT host) as unique_hosts FROM audit_log WHERE {date_filter}"
+    result = execute_analysis_query(conn, query, params, use_simple)
     
-    if result:
-        total_events, unique_users, unique_hosts = result
+    if result and len(result) > 0:
+        row = result[0]
         return {
-            'total_events': total_events,
-            'unique_users': unique_users,
-            'unique_hosts': unique_hosts
+            'total_events': row['total_events'],
+            'unique_users': row['unique_users'],
+            'unique_hosts': row['unique_hosts']
         }
     return {'total_events': 0, 'unique_users': 0, 'unique_hosts': 0}
 
@@ -1451,6 +1455,17 @@ def main():
         print("🔗 建立資料庫連線...")
         conn = get_simple_db_conn(config)
         print("✅ 資料庫連線成功")
+        
+        # 先檢查是否有資料
+        print("🔍 檢查資料是否存在...")
+        check_query = f"SELECT COUNT(*) as count FROM audit_log WHERE {date_filter}"
+        check_result = execute_simple_query(conn, check_query, date_filter_value)
+        
+        if not check_result or check_result[0]['count'] == 0:
+            print("⚠️  指定日期範圍內沒有資料，跳過分析")
+            return
+            
+        print(f"✅ 找到 {check_result[0]['count']:,} 筆資料，開始分析...")
         results = run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config, use_simple=True)
     except Exception as e:
         print(f"❌ 分析過程發生錯誤: {e}")
