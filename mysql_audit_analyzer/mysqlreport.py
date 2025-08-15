@@ -1,334 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, argparse, gzip, csv, calendar, tempfile, time, psutil, threading
+import os, sys, argparse, gzip, csv, calendar, tempfile
 from datetime import datetime, timedelta
 from typing import List, Optional
 import pymysql
 import smtplib
 from email.message import EmailMessage
-from contextlib import contextmanager
-import queue
-import threading
-
-# 全域資源監控變數
-_resource_monitor = None
-_query_semaphore = None
-
-class ResourceMonitor:
-    """資源監控類別 - 監控記憶體使用量並提供告警"""
-    def __init__(self, max_memory_mb=1024):
-        self.max_memory_mb = max_memory_mb
-        self.max_memory_bytes = max_memory_mb * 1024 * 1024
-        self.process = psutil.Process()
-        self.monitoring = False
-        
-    def get_memory_usage_mb(self):
-        """取得目前記憶體使用量 (MB)"""
-        try:
-            memory_info = self.process.memory_info()
-            return memory_info.rss / 1024 / 1024
-        except:
-            return 0
-            
-    def check_memory_limit(self):
-        """檢查記憶體是否超過限制"""
-        current_mb = self.get_memory_usage_mb()
-        if current_mb > self.max_memory_mb:
-            print(f"⚠️  記憶體使用量警告: {current_mb:.1f}MB / {self.max_memory_mb}MB")
-            return False
-        return True
-        
-    def force_gc_if_needed(self):
-        """必要時強制垃圾回收"""
-        import gc
-        if not self.check_memory_limit():
-            print("🗑️  執行垃圾回收以釋放記憶體...")
-            gc.collect()
-            time.sleep(0.5)  # 給系統時間釋放記憶體
-            return True
-        return False
-
-class MySQL57ConnectionPool:
-    """
-    針對 MySQL 5.7.27 優化的連接池實現
-    支援連接健康檢查、重試機制和資源監控
-    """
-    def __init__(self, host, port, user, password, database, charset='utf8mb4', 
-                 min_connections=2, max_connections=10, max_idle_time=300, **kwargs):
-        self.host = host
-        self.port = port
-        self.user = user
-        self.password = password
-        self.database = database
-        self.charset = charset
-        self.min_connections = min_connections
-        self.max_connections = max_connections
-        self.max_idle_time = max_idle_time  # 最大關置時間（秒）
-        self.kwargs = kwargs
-        
-        # 連接池和管理結構
-        self._pool = queue.Queue(maxsize=max_connections)
-        self._active_connections = set()  # 活躍連接集合
-        self._connection_timestamps = {}  # 連接時間戳
-        self._lock = threading.Lock()
-        self._created_connections = 0
-        self._stats = {
-            'created': 0,
-            'reused': 0,
-            'failed': 0,
-            'closed': 0
-        }
-        
-        # 初始化最小連接數
-        self._initialize_pool()
-        
-        # 啟動清理線程
-        self._cleanup_thread = threading.Thread(target=self._cleanup_idle_connections, daemon=True)
-        self._cleanup_thread.start()
-        
-    def _create_connection(self):
-        """創建 MySQL 5.7.27 優化的連接"""
-        try:
-            conn = pymysql.connect(
-                host=self.host,
-                port=self.port,
-                user=self.user,
-                password=self.password,
-                database=self.database,
-                charset=self.charset,
-                autocommit=True,
-                local_infile=True,
-                connect_timeout=30,
-                read_timeout=600,
-                write_timeout=600,
-                # MySQL 5.7.27 基本參數
-                sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO',
-                **self.kwargs
-            )
-            self._stats['created'] += 1
-            return conn
-        except Exception as e:
-            self._stats['failed'] += 1
-            raise e
-            
-    def _initialize_pool(self):
-        """初始化連接池至最小連接數"""
-        for _ in range(self.min_connections):
-            try:
-                conn = self._create_connection()
-                self._pool.put_nowait(conn)
-                self._connection_timestamps[id(conn)] = time.time()
-                self._created_connections += 1
-            except Exception as e:
-                print(f"⚠️  初始化連接池失敗: {e}")
-                break
-                
-    def _is_connection_valid(self, conn):
-        """檢查連接是否有效"""
-        try:
-            if not conn or not conn.open:
-                return False
-            # 使用輕量級檢查
-            conn.ping(reconnect=False)
-            return True
-        except:
-            return False
-            
-    def _cleanup_idle_connections(self):
-        """清理關置連接的後台線程"""
-        while True:
-            try:
-                time.sleep(60)  # 每分鐘檢查一次
-                current_time = time.time()
-                
-                with self._lock:
-                    # 檢查池中的連接
-                    temp_connections = []
-                    
-                    # 取出所有連接進行檢查
-                    while not self._pool.empty():
-                        try:
-                            conn = self._pool.get_nowait()
-                            conn_id = id(conn)
-                            
-                            # 檢查連接是否過期或無效
-                            if (conn_id in self._connection_timestamps and 
-                                current_time - self._connection_timestamps[conn_id] > self.max_idle_time) or \
-                               not self._is_connection_valid(conn):
-                                # 連接過期或無效，關閉它
-                                try:
-                                    conn.close()
-                                    self._stats['closed'] += 1
-                                except:
-                                    pass
-                                if conn_id in self._connection_timestamps:
-                                    del self._connection_timestamps[conn_id]
-                                self._created_connections -= 1
-                            else:
-                                # 連接仍然有效，保留它
-                                temp_connections.append(conn)
-                        except queue.Empty:
-                            break
-                    
-                    # 將有效連接放回池中
-                    for conn in temp_connections:
-                        try:
-                            self._pool.put_nowait(conn)
-                        except queue.Full:
-                            # 池已滿，關閉多餘連接
-                            try:
-                                conn.close()
-                                self._stats['closed'] += 1
-                            except:
-                                pass
-                    
-                    # 確保最小連接數
-                    current_pool_size = self._pool.qsize()
-                    if current_pool_size < self.min_connections:
-                        for _ in range(self.min_connections - current_pool_size):
-                            try:
-                                conn = self._create_connection()
-                                self._pool.put_nowait(conn)
-                                self._connection_timestamps[id(conn)] = time.time()
-                                self._created_connections += 1
-                            except:
-                                break
-                                
-            except Exception as e:
-                print(f"⚠️  連接池清理線程發生錯誤: {e}")
-                
-    def get_connection(self, timeout=30):
-        """從連接池獲取連接，支援重試機制"""
-        retry_count = 3
-        
-        for attempt in range(retry_count):
-            try:
-                # 嘗試從池中獲取現有連接
-                try:
-                    conn = self._pool.get(timeout=min(timeout, 10))
-                    
-                    # 檢查連接是否有效
-                    if self._is_connection_valid(conn):
-                        with self._lock:
-                            self._active_connections.add(id(conn))
-                            self._connection_timestamps[id(conn)] = time.time()
-                            self._stats['reused'] += 1
-                        return conn
-                    else:
-                        # 連接無效，嘗試創建新連接
-                        try:
-                            conn.close()
-                        except:
-                            pass
-                        
-                except queue.Empty:
-                    pass
-                
-                # 創建新連接
-                with self._lock:
-                    if self._created_connections < self.max_connections:
-                        conn = self._create_connection()
-                        self._created_connections += 1
-                        self._active_connections.add(id(conn))
-                        self._connection_timestamps[id(conn)] = time.time()
-                        return conn
-                    
-                # 如果到達最大連接數，等待一會兒再試
-                if attempt < retry_count - 1:
-                    time.sleep(1)
-                    
-            except Exception as e:
-                if attempt < retry_count - 1:
-                    print(f"⚠️  獲取連接失敗，第 {attempt + 1} 次重試: {e}")
-                    time.sleep(1)
-                else:
-                    raise e
-        
-        raise Exception("無法獲取資料庫連接，連接池已滿")
-    
-    def release_connection(self, conn):
-        """釋放連接回池中"""
-        if not conn:
-            return
-            
-        conn_id = id(conn)
-        
-        with self._lock:
-            if conn_id in self._active_connections:
-                self._active_connections.remove(conn_id)
-        
-        if self._is_connection_valid(conn):
-            try:
-                # 重設連接狀態
-                with conn.cursor() as cur:
-                    cur.execute("ROLLBACK")
-                    
-                self._connection_timestamps[conn_id] = time.time()
-                self._pool.put_nowait(conn)
-            except queue.Full:
-                # 池已滿，關閉連接
-                try:
-                    conn.close()
-                    self._stats['closed'] += 1
-                except:
-                    pass
-                with self._lock:
-                    self._created_connections -= 1
-                    if conn_id in self._connection_timestamps:
-                        del self._connection_timestamps[conn_id]
-            except Exception as e:
-                # 連接出錯，關閉它
-                try:
-                    conn.close()
-                    self._stats['closed'] += 1
-                except:
-                    pass
-                with self._lock:
-                    self._created_connections -= 1
-                    if conn_id in self._connection_timestamps:
-                        del self._connection_timestamps[conn_id]
-        else:
-            # 連接無效，關閉它
-            try:
-                conn.close()
-                self._stats['closed'] += 1
-            except:
-                pass
-            with self._lock:
-                self._created_connections -= 1
-                if conn_id in self._connection_timestamps:
-                    del self._connection_timestamps[conn_id]
-                    
-    def get_stats(self):
-        """獲取連接池統計資訊"""
-        with self._lock:
-            return {
-                'created_connections': self._created_connections,
-                'active_connections': len(self._active_connections),
-                'pool_size': self._pool.qsize(),
-                'max_connections': self.max_connections,
-                'min_connections': self.min_connections,
-                'stats': self._stats.copy()
-            }
-            
-    def close_all(self):
-        """關閉所有連接"""
-        with self._lock:
-            # 關閉池中的連接
-            while not self._pool.empty():
-                try:
-                    conn = self._pool.get_nowait()
-                    conn.close()
-                    self._stats['closed'] += 1
-                except:
-                    pass
-                    
-            # 清理狀態
-            self._created_connections = 0
-            self._active_connections.clear()
-            self._connection_timestamps.clear()
-
 
 # 加入 tqdm 支援
 try:
@@ -362,20 +40,6 @@ class Config:
         self.mysql_user = os.getenv('MYSQL_USER', 'root')
         self.mysql_password = os.getenv('MYSQL_PASSWORD', '')
         self.mysql_db = os.getenv('MYSQL_DB', 'auditdb')
-        # 新增資料庫連線池和效能相關設定
-        self.db_pool_size = int(os.getenv('DB_POOL_SIZE', '5'))
-        self.db_max_overflow = int(os.getenv('DB_MAX_OVERFLOW', '10'))
-        self.db_pool_timeout = int(os.getenv('DB_POOL_TIMEOUT', '30'))
-        self.db_query_timeout = int(os.getenv('DB_QUERY_TIMEOUT', '300'))
-        self.max_fetch_size = int(os.getenv('MAX_FETCH_SIZE', '100000'))
-        self.batch_fetch_size = int(os.getenv('BATCH_FETCH_SIZE', '10000'))
-        self.query_retry_count = int(os.getenv('QUERY_RETRY_COUNT', '3'))
-        self.retry_delay = float(os.getenv('RETRY_DELAY', '1.0'))
-        # 資源限制和節流控制
-        self.max_memory_usage_mb = int(os.getenv('MAX_MEMORY_USAGE_MB', '1024'))
-        self.query_throttle_delay = float(os.getenv('QUERY_THROTTLE_DELAY', '0.1'))
-        self.enable_resource_monitoring = os.getenv('ENABLE_RESOURCE_MONITORING', 'true').lower() == 'true'
-        self.max_concurrent_queries = int(os.getenv('MAX_CONCURRENT_QUERIES', '3'))
         self.log_base_path = os.getenv('LOG_BASE_PATH', '/var/log/mysql/audit')
         self.log_file_prefix = os.getenv('LOG_FILE_PREFIX', 'server_audit.log')
         self.output_dir = os.getenv('OUTPUT_DIR', '/tmp/mysql_reports')
@@ -401,6 +65,10 @@ class Config:
         # 新增 LOAD DATA INFILE 相關設定
         self.use_load_data_infile = os.getenv('USE_LOAD_DATA_INFILE', 'true').lower() == 'true'
         self.temp_dir = os.getenv('TEMP_DIR', '/tmp')
+        
+        # MySQL 5.7.27 特定設定
+        self.mysql_version = os.getenv('MYSQL_VERSION', '5.7.27')
+        self.batch_size = int(os.getenv('BATCH_SIZE', '10000'))
 
     def get_log_file_path(self, date_str: str = None) -> str:
         return os.path.join(self.log_base_path, self.log_file_prefix if not date_str else f"{self.log_file_prefix}-{date_str}")
@@ -435,255 +103,24 @@ class Config:
             "TEMP_DIR": self.temp_dir,
         }
 
-def init_resource_monitoring(config: Config):
-    """初始化資源監控"""
-    global _resource_monitor, _query_semaphore
-    
-    if config.enable_resource_monitoring:
-        _resource_monitor = ResourceMonitor(config.max_memory_usage_mb)
-        print(f"✅ 資源監控初始化完成 (記憶體限制: {config.max_memory_usage_mb}MB)")
-    
-    _query_semaphore = threading.Semaphore(config.max_concurrent_queries)
-    print(f"✅ 查詢並行控制初始化完成 (最大並行: {config.max_concurrent_queries})")
-
-# 全域連線池變數
-_connection_pool = None
-
-def init_connection_pool(config: Config):
-    """
-    初始化 MySQL 5.7.27 優化的資料庫連線池
-    """
-    global _connection_pool
-    if _connection_pool is None:
-        _connection_pool = MySQL57ConnectionPool(
-            host=config.mysql_host,
-            port=config.mysql_port,
-            user=config.mysql_user,
-            password=config.mysql_password,
-            database=config.mysql_db,
-            charset='utf8mb4',
-            min_connections=max(1, config.db_pool_size // 2),  # 最小連接數
-            max_connections=config.db_pool_size + config.db_max_overflow,
-            max_idle_time=300,  # 5分鐘關置時間
-        )
-        print(f"✅ MySQL 5.7.27 連線池初始化完成")
-        print(f"   最小連接: {_connection_pool.min_connections}")
-        print(f"   最大連接: {_connection_pool.max_connections}")
-        print(f"   關置時間: {_connection_pool.max_idle_time}秒")
-
-@contextmanager
 def get_db_conn(config: Config):
-    """
-    取得資料庫連線 (使用 MySQL 5.7.27 優化連線池和自動釋放)
-    """
-    if _connection_pool is None:
-        init_connection_pool(config)
-    
-    conn = None
-    start_time = time.time()
-    
-    try:
-        conn = _connection_pool.get_connection(timeout=config.db_pool_timeout)
-        
-        # 記錄連接獲取時間
-        get_time = time.time() - start_time
-        if get_time > 5:  # 如果獲取連接超過5秒，給出警告
-            print(f"⚠️  連接獲取耗時: {get_time:.2f}秒")
-            
-        yield conn
-        
-    except Exception as e:
-        if conn:
-            try:
-                conn.rollback()
-            except:
-                pass  # 忽略 rollback 錯誤
-        raise e
-    finally:
-        if conn:
-            _connection_pool.release_connection(conn)
-
-def get_legacy_db_conn(config: Config):
-    """
-    取得傳統資料庫連線 (用於不支援 context manager 的舊程式碼)
-    針對 MySQL 5.7.27 優化
-    """
-    connection = pymysql.connect(
+    """建立針對 MySQL 5.7.27 優化的資料庫連線"""
+    return pymysql.connect(
         host=config.mysql_host,
         port=config.mysql_port,
         user=config.mysql_user,
         password=config.mysql_password,
         database=config.mysql_db,
         charset='utf8mb4',
-        autocommit=True,
+        collation='utf8mb4_unicode_ci',
+        autocommit=False,  # 使用事務以確保一致性
         local_infile=True,
+        # 連線優化設定
         connect_timeout=30,
-        read_timeout=config.db_query_timeout,
-        write_timeout=config.db_query_timeout,
-        # MySQL 5.7.27 基本參數
-        sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'
+        read_timeout=60,
+        write_timeout=60,
+        cursorclass=pymysql.cursors.DictCursor  # 使用字典游標便於處理
     )
-    return connection
-
-def get_connection_pool_stats():
-    """獲取連接池統計資訊"""
-    global _connection_pool
-    if _connection_pool and hasattr(_connection_pool, 'get_stats'):
-        return _connection_pool.get_stats()
-    return None
-
-def close_connection_pool():
-    """關閉連接池"""
-    global _connection_pool
-    if _connection_pool and hasattr(_connection_pool, 'close_all'):
-        _connection_pool.close_all()
-        _connection_pool = None
-        print("✅ 連接池已關閉")
-
-def get_simple_db_conn(config: Config):
-    """
-    取得簡單的資料庫連線用於分析 (不使用連接池)
-    針對 MySQL 5.7.27 優化
-    """
-    connection = pymysql.connect(
-        host=config.mysql_host,
-        port=config.mysql_port,
-        user=config.mysql_user,
-        password=config.mysql_password,
-        database=config.mysql_db,
-        charset='utf8mb4',
-        autocommit=True,
-        connect_timeout=30,
-        read_timeout=600,  # 分析查詢可能需要更長時間
-        write_timeout=600,
-        cursorclass=pymysql.cursors.DictCursor,  # 使用字典游標便於結果處理
-        # MySQL 5.7.27 基本參數
-        sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'
-    )
-    return connection
-
-def execute_simple_query(conn, query, params=None, max_rows=10000):
-    """
-    執行簡單查詢用於分析 (不使用複雜的重試和資源監控)
-    """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            # 限制結果數量以防止記憶體問題
-            if "SELECT COUNT" in query.upper() or "LIMIT" in query.upper():
-                return cur.fetchall()
-            else:
-                return cur.fetchmany(max_rows)
-    except Exception as e:
-        print(f"❌ 查詢執行失敗: {e}")
-        return []
-
-def execute_analysis_query(conn, query, params=None, use_simple=True):
-    """
-    執行分析查詢，可選擇簡單模式或複雜模式
-    """
-    if use_simple:
-        return execute_simple_query(conn, query, params)
-    else:
-        return execute_query_with_retry(conn, query, params, None, 'fetchall')
-
-def execute_query_with_retry(conn, query, params=None, config=None, fetch_mode='fetchall'):
-    """
-    執行查詢並加入重試機制、記憶體管理和資源監控
-    
-    Args:
-        conn: 資料庫連線
-        query: SQL查詢語句
-        params: 查詢參數
-        config: 設定物件
-        fetch_mode: 'fetchall', 'fetchone', 'fetchmany', 'iterator'
-    
-    Returns:
-        查詢結果
-    """
-    global _resource_monitor, _query_semaphore
-    
-    retry_count = config.query_retry_count if config else 3
-    retry_delay = config.retry_delay if config else 1.0
-    max_fetch_size = config.max_fetch_size if config else 100000
-    batch_size = config.batch_fetch_size if config else 10000
-    throttle_delay = config.query_throttle_delay if config else 0.1
-    
-    # 資源監控和並行控制
-    if _resource_monitor:
-        _resource_monitor.force_gc_if_needed()
-    
-    # 使用信號量控制並行查詢數量
-    if _query_semaphore:
-        _query_semaphore.acquire()
-    
-    try:
-        for attempt in range(retry_count):
-            try:
-                # 查詢節流
-                if throttle_delay > 0:
-                    time.sleep(throttle_delay)
-                
-                with conn.cursor() as cur:
-                            # MySQL 5.7.27 查詢優化參數設定
-                    if config:
-                        try:
-                            # 不再自動設定 SQL 參數
-                            pass
-                        except Exception as opt_error:
-                            # 忽略優化參數設置失敗，但記錄警告
-                            print(f"⚠️  MySQL 5.7.27 優化參數設置失敗: {opt_error}")
-                    
-                    cur.execute(query, params)
-                    
-                    if fetch_mode == 'fetchone':
-                        result = cur.fetchone()
-                    elif fetch_mode == 'fetchmany':
-                        result = cur.fetchmany(batch_size)
-                    elif fetch_mode == 'iterator':
-                        result = cur  # 回傳游標迭代器，節省記憶體
-                    elif fetch_mode == 'fetchall_safe':
-                        # 安全的 fetchall，限制結果數量並監控記憶體
-                        results = []
-                        count = 0
-                        while True:
-                            # 檢查記憶體使用量
-                            if _resource_monitor and not _resource_monitor.check_memory_limit():
-                                print(f"⚠️  記憶體不足，查詢結果截斷於 {count:,} 筆")
-                                break
-                            
-                            batch = cur.fetchmany(batch_size)
-                            if not batch:
-                                break
-                            results.extend(batch)
-                            count += len(batch)
-                            
-                            if count >= max_fetch_size:
-                                print(f"⚠️  查詢結果超過限制 ({max_fetch_size:,} 筆)，已截斷")
-                                break
-                        result = results
-                    else:  # fetchall (default)
-                        result = cur.fetchall()
-                    
-                    return result
-                        
-            except (pymysql.Error, Exception) as e:
-                if attempt < retry_count - 1:
-                    print(f"⚠️  查詢失敗，第 {attempt + 1}/{retry_count} 次重試... 錯誤: {str(e)}")
-                    time.sleep(retry_delay * (attempt + 1))  # 指數退避
-                else:
-                    print(f"❌ 查詢最終失敗: {str(e)}")
-                    raise e
-    finally:
-        # 釋放信號量
-        if _query_semaphore:
-            _query_semaphore.release()
-        
-        # 如果是長時間查詢，輸出統計資訊
-        if _connection_pool and hasattr(_connection_pool, 'get_stats'):
-            stats = _connection_pool.get_stats()
-            if stats['active_connections'] > stats['max_connections'] * 0.8:
-                print(f"⚠️  連接池使用率過高: {stats['active_connections']}/{stats['max_connections']}")
 
 def get_file_line_count(file_path):
     """快速計算檔案行數，用於進度條"""
@@ -781,66 +218,40 @@ def import_log_file_to_db_optimized(file_path, log_date, conn, config):
         processing_time = (datetime.now() - start_time).total_seconds()
         print(f"✅ 資料處理完成: {row_count:,} 筆，耗時 {processing_time:.2f} 秒")
         
-        # 使用 MySQL 5.7.27 優化的 LOAD DATA LOCAL INFILE 批量載入
-        print("💾 正在使用 MySQL 5.7.27 優化載入資料到資料庫...")
+        # 使用 LOAD DATA LOCAL INFILE 批量載入
+        print("💾 正在載入資料到資料庫...")
         db_start_time = datetime.now()
         
         with conn.cursor() as cur:
             # 先檢查是否已存在該日期的資料，如果有則先刪除
-            delete_sql = "DELETE FROM audit_log WHERE log_date = %s"
-            cur.execute(delete_sql, (log_date,))
+            cur.execute("DELETE FROM audit_log WHERE log_date = %s", (log_date,))
             deleted_count = cur.rowcount
             if deleted_count > 0:
                 print(f"🗑️  刪除舊資料 {deleted_count:,} 筆")
             
-            # MySQL 5.7.27 特定的 LOAD DATA LOCAL INFILE 語法
+            # MySQL 5.7.27 優化的 LOAD DATA LOCAL INFILE
             load_sql = f"""
-            LOAD DATA LOCAL INFILE '{temp_csv.name.replace(chr(92), '/')}'
+            LOAD DATA LOCAL INFILE '{temp_csv.name}'
             INTO TABLE audit_log
-            CHARACTER SET utf8mb4
             FIELDS TERMINATED BY ','
             OPTIONALLY ENCLOSED BY '"'
-            ESCAPED BY '"'
             LINES TERMINATED BY '\\n'
-            (log_date, timestamp, server_host, username, host, connection_id, query_id, operation, dbname, query, retcode)
+            (log_date, @timestamp_str, server_host, username, host, connection_id, query_id, operation, dbname, query, retcode)
+            SET timestamp = STR_TO_DATE(@timestamp_str, '%Y%m%d %H:%i:%s'),
+                created_at = CURRENT_TIMESTAMP,
+                query_time = NULL,
+                rows_sent = 0,
+                rows_examined = 0
             """
             
-            # 執行 LOAD DATA 並捕捉可能的錯誤
-            try:
-                cur.execute(load_sql)
-                # 獲取實際載入的行數
-                cur.execute("SELECT ROW_COUNT()")
-                loaded_rows = cur.fetchone()[0]
-                
-                # 獲取 MySQL 警告訊息
-                cur.execute("SHOW WARNINGS")
-                warnings = cur.fetchall()
-                if warnings:
-                    print(f"⚠️  MySQL 警告 ({len(warnings)} 個):")
-                    for level, code, message in warnings[:5]:  # 只顯示前5個警告
-                        print(f"   {level} {code}: {message}")
-                    if len(warnings) > 5:
-                        print(f"   ... 及其他 {len(warnings) - 5} 個警告")
-                        
-            except pymysql.Error as mysql_error:
-                error_code = mysql_error.args[0] if mysql_error.args else 0
-                error_msg = mysql_error.args[1] if len(mysql_error.args) > 1 else str(mysql_error)
-                
-                print(f"❌ MySQL LOAD DATA 錯誤 {error_code}: {error_msg}")
-                
-                # 常見錯誤的特定處理
-                if error_code in [1148, 1290, 2061]:  # LOAD DATA LOCAL INFILE 相關錯誤
-                    print("🔄 LOAD DATA LOCAL INFILE 被禁用或不支持，將回退到原始方法")
-                    return import_log_file_to_db_fallback(file_path, log_date, conn)
-                elif error_code in [1062]:  # 重複鍵錯誤
-                    print(f"⚠️  偵測到重複資料，嘗試先清理後再載入")
-                    cur.execute("DELETE FROM audit_log WHERE log_date = %s", (log_date,))
-                    cur.execute(load_sql)  # 重試
-                    cur.execute("SELECT ROW_COUNT()")
-                    loaded_rows = cur.fetchone()[0]
-                else:
-                    # 其他錯誤，拋出異常
-                    raise mysql_error
+            cur.execute(load_sql)
+            
+            # 提交事務
+            conn.commit()
+            
+            # 獲取實際載入的行數
+            cur.execute("SELECT ROW_COUNT()")
+            loaded_rows = cur.fetchone()[0]
             
             db_duration = (datetime.now() - db_start_time).total_seconds()
             total_duration = (datetime.now() - start_time).total_seconds()
@@ -855,6 +266,11 @@ def import_log_file_to_db_optimized(file_path, log_date, conn, config):
             
     except Exception as e:
         print(f"❌ 優化匯入失敗: {e}")
+        # 回滾事務
+        try:
+            conn.rollback()
+        except:
+            pass
         # 如果 LOAD DATA INFILE 失敗，回退到原始方法
         print("🔄 回退到原始匯入方法...")
         import_log_file_to_db_fallback(file_path, log_date, conn)
@@ -1003,7 +419,7 @@ def get_log_file_for_date(config, date_str):
 
 # ========== 分析查詢（加入進度顯示） ==========
 
-def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config, use_simple=False):
+def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config):
     """
     執行所有分析功能並顯示進度
     """
@@ -1025,9 +441,9 @@ def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filte
         
         try:
             if args:
-                results[name] = func(conn, date_filter, date_filter_value, *args, config=config, use_simple=use_simple)
+                results[name] = func(conn, date_filter, date_filter_value, *args)
             else:
-                results[name] = func(conn, date_filter, date_filter_value, config=config, use_simple=use_simple)
+                results[name] = func(conn, date_filter, date_filter_value)
             
             duration = (datetime.now() - start_time).total_seconds()
             
@@ -1046,70 +462,94 @@ def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filte
     
     return results
 
-def analyze_summary(conn, date_filter, date_filter_value, config=None, use_simple=False):
-    """基本統計分析 - 使用優化查詢"""
-    if isinstance(date_filter_value, tuple):
-        params = date_filter_value
-    else:
-        params = (date_filter_value,)
-    
-    query = f"SELECT COUNT(*) as total_events, COUNT(DISTINCT username) as unique_users, COUNT(DISTINCT host) as unique_hosts FROM audit_log WHERE {date_filter}"
-    result = execute_analysis_query(conn, query, params, use_simple)
-    
-    if result and len(result) > 0:
-        row = result[0]
+def analyze_summary(conn, date_filter, date_filter_value):
+    """針對 MySQL 5.7.27 優化的摘要分析"""
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        
+        # 使用優化的查詢，利用索引
+        summary_sql = f"""
+        SELECT 
+            COUNT(*) as total_events,
+            COUNT(DISTINCT username) as unique_users,
+            COUNT(DISTINCT host) as unique_hosts,
+            COUNT(DISTINCT operation) as unique_operations,
+            SUM(CASE WHEN retcode != 0 THEN 1 ELSE 0 END) as total_errors
+        FROM audit_log 
+        WHERE {date_filter}
+        """
+        
+        cur.execute(summary_sql, params)
+        result = cur.fetchone()
+        
         return {
-            'total_events': row['total_events'],
-            'unique_users': row['unique_users'],
-            'unique_hosts': row['unique_hosts']
+            'total_events': result['total_events'],
+            'unique_users': result['unique_users'],
+            'unique_hosts': result['unique_hosts'],
+            'unique_operations': result['unique_operations'],
+            'total_errors': result['total_errors']
         }
-    return {'total_events': 0, 'unique_users': 0, 'unique_hosts': 0}
 
-def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5, config=None, use_simple=False):
-    """失敗登入分析 - 使用優化查詢和結果限制"""
-    if isinstance(date_filter_value, tuple):
-        params = date_filter_value + (threshold,)
-        params2 = date_filter_value
-    else:
-        params = (date_filter_value, threshold)
-        params2 = (date_filter_value,)
-    
-    # 查詢可疑使用者 (使用 FORCE INDEX 和 MySQL 5.7.27 優化)
-    query1 = f"""SELECT username, COUNT(*) as fail_count
-                FROM audit_log FORCE INDEX (operation, username)
-                WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}
-                GROUP BY username
-                HAVING fail_count >= %s
-                ORDER BY fail_count DESC
-                LIMIT 1000"""
-    by_user = execute_analysis_query(conn, query1, params, use_simple)
-    
-    # 查詢可疑IP (使用 FORCE INDEX 和 MySQL 5.7.27 優化)
-    query2 = f"""SELECT host, COUNT(*) as fail_count
-                FROM audit_log FORCE INDEX (operation, host)
-                WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}
-                GROUP BY host
-                HAVING fail_count >= %s
-                ORDER BY fail_count DESC
-                LIMIT 1000"""
-    by_ip = execute_analysis_query(conn, query2, params, use_simple)
-    
-    # 總失敗次數 (使用 FORCE INDEX)
-    query3 = f"SELECT COUNT(*) FROM audit_log FORCE INDEX (operation) WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}"
-    total_result = execute_analysis_query(conn, query3, params2, use_simple)
-    if total_result and len(total_result) > 0:
-        total = total_result[0]['COUNT(*)'] if use_simple else total_result[0][0]
-    else:
-        total = 0
-    
-    return {
-        'total': total,
-        'by_user': by_user or [],
-        'by_ip': by_ip or []
-    }
+def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5):
+    """針對 MySQL 5.7.27 優化的失敗登入分析，使用複合索引"""
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value + (threshold,)
+            params2 = date_filter_value
+        else:
+            params = (date_filter_value, threshold)
+            params2 = (date_filter_value,)
+        
+        # 使用索引優化的查詢 - idx_retcode_operation
+        failed_by_user_sql = f"""
+        SELECT username, COUNT(*) as fail_count,
+               MIN(timestamp) as first_attempt,
+               MAX(timestamp) as last_attempt
+        FROM audit_log
+        WHERE retcode != 0 AND operation = 'CONNECT' AND {date_filter}
+        GROUP BY username
+        HAVING fail_count >= %s
+        ORDER BY fail_count DESC, last_attempt DESC
+        """
+        
+        failed_by_ip_sql = f"""
+        SELECT host, COUNT(*) as fail_count,
+               COUNT(DISTINCT username) as affected_users,
+               MIN(timestamp) as first_attempt,
+               MAX(timestamp) as last_attempt
+        FROM audit_log
+        WHERE retcode != 0 AND operation = 'CONNECT' AND {date_filter}
+        GROUP BY host
+        HAVING fail_count >= %s
+        ORDER BY fail_count DESC, last_attempt DESC
+        """
+        
+        total_failed_sql = f"""
+        SELECT COUNT(*) as total_count
+        FROM audit_log 
+        WHERE retcode != 0 AND operation = 'CONNECT' AND {date_filter}
+        """
+        
+        cur.execute(failed_by_user_sql, params)
+        by_user = cur.fetchall()
+        
+        cur.execute(failed_by_ip_sql, params)
+        by_ip = cur.fetchall()
+        
+        cur.execute(total_failed_sql, params2)
+        total = cur.fetchone()['total_count']
+        
+        return {
+            'total': total,
+            'by_user': by_user,
+            'by_ip': by_ip,
+            'threshold': threshold
+        }
 
-def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords, config=None, use_simple=False):
-    """特權操作分析 - 使用優化查詢和結果限制"""
+def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords):
     like_clauses = " OR ".join(["UPPER(query) LIKE %s" for _ in keywords])
     like_params = [f"%{k.upper()}%" for k in keywords]
     if isinstance(date_filter_value, tuple):
@@ -1117,82 +557,83 @@ def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords
     else:
         params = like_params + [date_filter_value]
 
-    # 按使用者統計特權操作 (使用 FORCE INDEX 和 MySQL 5.7.27 優化)
-    query1 = f"""SELECT username, COUNT(*) as cnt
-                FROM audit_log FORCE INDEX (operation, username)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""SELECT username, COUNT(*) as cnt
+                FROM audit_log
                 WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}
                 GROUP BY username
                 ORDER BY cnt DESC
-                LIMIT 500"""
-    by_user = execute_query_with_retry(conn, query1, params, config, 'fetchall_safe')
-
-    # 總特權操作數量 (使用 FORCE INDEX)
-    query2 = f"""SELECT COUNT(*) FROM audit_log FORCE INDEX (operation)
-                WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}"""
-    total_result = execute_query_with_retry(conn, query2, params, config, 'fetchone')
-    total = total_result[0] if total_result else 0
-
-    # 詳細特權操作記錄 (使用 FORCE INDEX 和查詢優化)
-    query3 = f"""SELECT username, 
-                        CASE WHEN CHAR_LENGTH(query) > 200 THEN CONCAT(LEFT(query, 200), '...') ELSE query END as query_short,
-                        timestamp
-                FROM audit_log FORCE INDEX (operation)
+            """,
+            params
+        )
+        by_user = cur.fetchall()
+        cur.execute(
+            f"""SELECT COUNT(*) FROM audit_log
+                WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}
+            """,
+            params
+        )
+        total = cur.fetchone()[0]
+        cur.execute(
+            f"""SELECT username, query, timestamp
+                FROM audit_log
                 WHERE operation='QUERY' AND ({like_clauses}) AND {date_filter}
                 ORDER BY timestamp DESC
-                LIMIT 1000"""
-    details = execute_query_with_retry(conn, query3, params, config, 'fetchall_safe')
+            """,
+            params
+        )
+        details = cur.fetchall()
+        return {
+            'total': total,
+            'by_user': by_user,
+            'details': details
+        }
 
-    return {
-        'total': total,
-        'by_user': by_user or [],
-        'details': details or []
-    }
-
-def analyze_operation_stats(conn, date_filter, date_filter_value, config=None, use_simple=False):
-    """操作類型統計分析 - 使用優化查詢"""
-    if isinstance(date_filter_value, tuple):
-        params = date_filter_value
-    else:
-        params = (date_filter_value,)
-    
-    # 使用 FORCE INDEX 和 MySQL 5.7.27 優化
-    query = f"""SELECT operation, COUNT(*) as cnt
-                FROM audit_log FORCE INDEX (operation)
+def analyze_operation_stats(conn, date_filter, date_filter_value):
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT operation, COUNT(*) as cnt
+                FROM audit_log
                 WHERE {date_filter}
                 GROUP BY operation
                 ORDER BY cnt DESC
-                LIMIT 100"""
-    
-    result = execute_query_with_retry(conn, query, params, config, 'fetchall_safe')
-    return result or []
+            """,
+            params
+        )
+        return cur.fetchall()
 
-def analyze_error_codes(conn, date_filter, date_filter_value, config=None, use_simple=False):
-    """錯誤代碼分析 - 使用優化查詢"""
-    if isinstance(date_filter_value, tuple):
-        params = date_filter_value
-    else:
-        params = (date_filter_value,)
-    
-    # 錯誤代碼統計 (使用 FORCE INDEX 和 MySQL 5.7.27 優化)
-    query1 = f"""SELECT retcode, COUNT(*) as cnt
-                FROM audit_log FORCE INDEX (operation)
+def analyze_error_codes(conn, date_filter, date_filter_value):
+    with conn.cursor() as cur:
+        if isinstance(date_filter_value, tuple):
+            params = date_filter_value
+        else:
+            params = (date_filter_value,)
+        cur.execute(
+            f"""SELECT retcode, COUNT(*) as cnt
+                FROM audit_log
                 WHERE retcode!=0 AND operation!='CHANGEUSER' AND {date_filter}
                 GROUP BY retcode
                 ORDER BY cnt DESC
-                LIMIT 100"""
-    error_codes = execute_query_with_retry(conn, query1, params, config, 'fetchall_safe')
-    
-    # 總錯誤數量 (使用 FORCE INDEX)
-    query2 = f"SELECT COUNT(*) FROM audit_log FORCE INDEX (operation) WHERE retcode!=0 AND operation!='CHANGEUSER' AND {date_filter}"
-    total_result = execute_query_with_retry(conn, query2, params, config, 'fetchone')
-    total_errors = total_result[0] if total_result else 0
-    
-    return {
-        'total_errors': total_errors,
-        'error_codes': error_codes or []
-    }
+            """,
+            params
+        )
+        error_codes = cur.fetchall()
+        cur.execute(
+            f"SELECT COUNT(*) FROM audit_log WHERE retcode!=0 AND operation!='CHANGEUSER' AND {date_filter}",
+            params
+        )
+        total_errors = cur.fetchone()[0]
+        return {
+            'total_errors': total_errors,
+            'error_codes': error_codes
+        }
 
-def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_start, wh_end, config=None, use_simple=False):
+def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_start, wh_end):
     if not users:
         return {'total': 0, 'details': []}
     user_list = ','.join(["'%s'" % u for u in users])
@@ -1219,7 +660,7 @@ def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_s
                 after_hours.append((username, host, operation, dt.strftime('%Y-%m-%d %H:%M:%S')))
         return {'total': len(after_hours), 'details': after_hours[:50]}
 
-def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users, config=None, use_simple=False):
+def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users):
     if not users:
         return {'total': 0, 'by_user': [], 'details': []}
     user_list = ','.join(["'%s'" % u for u in users])
@@ -1256,7 +697,7 @@ def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users, 
         total = cur.fetchone()[0]
         return {'total': total, 'by_user': by_user, 'details': details}
 
-def analyze_non_whitelisted_ips(conn, date_filter, date_filter_value, allowed_ips, config=None, use_simple=False):
+def analyze_non_whitelisted_ips(conn, date_filter, date_filter_value, allowed_ips):
     if not allowed_ips:
         return {'total': 0, 'by_ip': [], 'details': []}
     ip_list = ','.join(["'%s'" % ip for ip in allowed_ips])
@@ -1533,6 +974,70 @@ def generate_pdf_report(output_dir, report_title, summary, failed, priv_ops, pri
 
 # ========== 郵件寄送 ==========
 
+def check_mysql57_performance(conn):
+    """MySQL 5.7.27 效能檢查和建議"""
+    print("🔍 正在檢查 MySQL 5.7.27 效能狀態...")
+    performance_info = {}
+    
+    with conn.cursor() as cur:
+        try:
+            # 檢查版本
+            cur.execute("SELECT VERSION() as version")
+            version_info = cur.fetchone()
+            performance_info['version'] = version_info['version']
+            
+            # 檢查 InnoDB 狀態
+            cur.execute("""
+                SELECT variable_name, variable_value 
+                FROM information_schema.global_status 
+                WHERE variable_name IN (
+                    'Innodb_buffer_pool_size',
+                    'Innodb_buffer_pool_pages_total',
+                    'Innodb_buffer_pool_pages_free',
+                    'Innodb_buffer_pool_read_requests',
+                    'Innodb_buffer_pool_reads'
+                )
+            """)
+            innodb_status = {row['variable_name']: row['variable_value'] for row in cur.fetchall()}
+            performance_info['innodb'] = innodb_status
+            
+            # 檢查查詢快取 (MySQL 5.7 still supports it)
+            cur.execute("""
+                SELECT variable_name, variable_value 
+                FROM information_schema.global_variables 
+                WHERE variable_name IN ('query_cache_size', 'query_cache_type')
+            """)
+            query_cache = {row['variable_name']: row['variable_value'] for row in cur.fetchall()}
+            performance_info['query_cache'] = query_cache
+            
+            # 檢查表狀態
+            cur.execute("""
+                SELECT table_name, engine, table_rows, data_length, index_length
+                FROM information_schema.tables 
+                WHERE table_schema = DATABASE() AND table_name = 'audit_log'
+            """)
+            table_info = cur.fetchone()
+            if table_info:
+                performance_info['table_info'] = table_info
+            
+            # 檢查索引使用情況
+            cur.execute("""
+                SELECT index_name, cardinality, sub_part, packed, nullable, index_type
+                FROM information_schema.statistics 
+                WHERE table_schema = DATABASE() AND table_name = 'audit_log'
+                ORDER BY index_name, seq_in_index
+            """)
+            index_info = cur.fetchall()
+            performance_info['indexes'] = index_info
+            
+            print("✅ MySQL 5.7.27 效能檢查完成")
+            return performance_info
+            
+        except Exception as e:
+            print(f"⚠️  效能檢查時發生錯誤: {e}")
+            return None
+
+
 def send_email_with_attachment(config: Config, subject, body, attachment_path):
     if not (config.smtp_server and config.mail_from and config.mail_to):
         print("❌ SMTP 或收件人設定不完整，無法寄信。")
@@ -1567,7 +1072,7 @@ def send_email_with_attachment(config: Config, subject, body, attachment_path):
 # ========== 主程式（加入完整的進度追蹤） ==========
 
 def main():
-    parser = argparse.ArgumentParser(description='MySQL Audit Log Security Analyzer (MySQL backend) - Enhanced with Progress Tracking')
+    parser = argparse.ArgumentParser(description='MySQL 5.7.27 Audit Log Security Analyzer - Optimized for MySQL 5.7.27')
     parser.add_argument('--import-date', help='Import logs for specific date (format: YYYY-MM-DD)')
     parser.add_argument('--import-month', help='Import logs for specific month (format: YYYY-MM)')
     parser.add_argument('--analyze-date', help='Analyze logs for specific date (format: YYYY-MM-DD)')
@@ -1577,6 +1082,7 @@ def main():
     parser.add_argument('--show-env', action='store_true', help='Show all env/config parameters and exit')
     parser.add_argument('--disable-load-data', action='store_true', help='Disable LOAD DATA INFILE optimization')
     parser.add_argument('--disable-progress', action='store_true', help='Disable progress bars (useful for automation)')
+    parser.add_argument('--check-performance', action='store_true', help='Check MySQL 5.7.27 performance status')
     
     args = parser.parse_args()
     config = Config()
@@ -1599,56 +1105,38 @@ def main():
             print(f"{k}: {v}")
         return
 
-    # 程式開始執行時間和統計初始化
+    # 程式開始執行時間
     program_start_time = datetime.now()
-    print(f"🚀 MySQL 5.7.27 稿核日誌分析程式開始執行: {program_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚀 程式開始執行: {program_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 程式執行統計
-    execution_stats = {
-        'start_time': program_start_time,
-        'import_files': 0,
-        'import_success': 0,
-        'import_failed': 0,
-        'total_records_imported': 0,
-        'analysis_queries': 0,
-        'analysis_time': 0,
-        'errors': [],
-        'warnings': []
-    }
-    
-    # 初始化資源監控
     try:
-        init_resource_monitoring(config)
-    except Exception as e:
-        print(f"⚠️  資源監控初始化失敗: {e}")
-    
-    # 初始化連線池
-    try:
-        init_connection_pool(config)
-    except Exception as e:
-        print(f"❌ 資料庫連線池初始化失敗: {e}")
-        print("🔄 嘗試使用傳統連線方式...")
-        try:
-            test_conn = get_legacy_db_conn(config)
-            test_conn.close()
-            print("✅ 資料庫連線測試成功")
-        except Exception as e2:
-            print(f"❌ 資料庫完全無法連線: {e2}")
+        conn = get_db_conn(config)
+        print(f"✅ MySQL {config.mysql_version} 資料庫連線成功")
+        
+        # 檢查效能狀態（如果需要）
+        if args.check_performance:
+            performance_info = check_mysql57_performance(conn)
+            if performance_info:
+                print("\n📊 MySQL 5.7.27 效能狀態:")
+                print(f"   版本: {performance_info.get('version', 'Unknown')}")
+                if 'table_info' in performance_info and performance_info['table_info']:
+                    table = performance_info['table_info']
+                    print(f"   audit_log 表資料列數: {table['table_rows']:,}")
+                    print(f"   資料大小: {int(table['data_length'])/(1024*1024):.2f} MB")
+                    print(f"   索引大小: {int(table['index_length'])/(1024*1024):.2f} MB")
             return
+        
+            
+    except Exception as e:
+        print(f"❌ 資料庫連線失敗: {e}")
+        return
 
     # 匯入日誌
     if args.import_date:
         print(f"\n📅 開始匯入單日日誌: {args.import_date}")
         log = get_log_file_for_date(config, args.import_date)
         if log:
-            try:
-                conn = get_legacy_db_conn(config)  # 匯入使用傳統連線
-                import_log_file_to_db(log[0], log[1], conn, config)
-                conn.close()
-            except Exception as e:
-                print(f"❌ 匯入過程發生錯誤: {e}")
-                if 'conn' in locals():
-                    conn.close()
+            import_log_file_to_db(log[0], log[1], conn, config)
         else:
             print(f"❌ No log file found for {args.import_date}")
         
@@ -1682,30 +1170,27 @@ def main():
             'total_records': 0
         }
         
-        conn = None
-        try:
-            conn = get_legacy_db_conn(config)  # 月份匯入使用傳統連線
+        for i, (log_path, log_date) in enumerate(logs, 1):
+            if not TQDM_AVAILABLE:
+                print(f"\n📁 處理檔案 {i}/{total_files}: {os.path.basename(log_path)}")
+            else:
+                month_progress.set_description(f"📁 處理: {os.path.basename(log_path)}")
             
-            for i, (log_path, log_date) in enumerate(logs, 1):
-                if not TQDM_AVAILABLE:
-                    print(f"\n📁 處理檔案 {i}/{total_files}: {os.path.basename(log_path)}")
-                else:
-                    month_progress.set_description(f"📁 處理: {os.path.basename(log_path)}")
-                
-                try:
-                    import_log_file_to_db(log_path, log_date, conn, config)
-                    import_stats['success_files'] += 1
-                except Exception as e:
-                    print(f"❌ 檔案 {log_path} 匯入失敗: {e}")
-                    import_stats['failed_files'] += 1
-        except Exception as e:
-            print(f"❌ 月份匯入過程發生錯誤: {e}")
-        finally:
-            if conn:
-                conn.close()
-        
-        # 統計處理
-        import_stats['total_files'] = len(logs)
+            try:
+                import_log_file_to_db(log_path, log_date, conn, config)
+                import_stats['success_files'] += 1
+            except Exception as e:
+                print(f"❌ 檔案 {log_path} 匯入失敗: {e}")
+                import_stats['failed_files'] += 1
+            
+            import_stats['total_files'] += 1
+            
+            if TQDM_AVAILABLE:
+                month_progress.update(1)
+                month_progress.set_postfix({
+                    '成功': import_stats['success_files'],
+                    '失敗': import_stats['failed_files']
+                })
         
         if TQDM_AVAILABLE:
             month_progress.close()
@@ -1755,31 +1240,8 @@ def main():
         ("非白名單IP分析", analyze_non_whitelisted_ips, (config.allowed_ips,))
     ]
     
-    # 執行分析 (使用簡單連線)
-    conn = None
-    try:
-        print("🔗 建立資料庫連線...")
-        conn = get_simple_db_conn(config)
-        print("✅ 資料庫連線成功")
-        
-        # 先檢查是否有資料
-        print("🔍 檢查資料是否存在...")
-        check_query = f"SELECT COUNT(*) as count FROM audit_log WHERE {date_filter}"
-        check_result = execute_simple_query(conn, check_query, date_filter_value)
-        
-        if not check_result or check_result[0]['count'] == 0:
-            print("⚠️  指定日期範圍內沒有資料，跳過分析")
-            return
-            
-        print(f"✅ 找到 {check_result[0]['count']:,} 筆資料，開始分析...")
-        results = run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config, use_simple=True)
-    except Exception as e:
-        print(f"❌ 分析過程發生錯誤: {e}")
-        return
-    finally:
-        if conn:
-            conn.close()
-            print("🔗 資料庫連線已關閉")
+    # 執行分析
+    results = run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config)
     
     # 解構結果
     summary = results.get("基本統計", {})
@@ -1867,56 +1329,12 @@ def main():
     print(f"🕒 總執行時間: {total_duration:.2f} 秒")
     print(f"🏁 程式結束: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 最終清理和統計輸出
-    execution_stats['end_time'] = datetime.now()
-    execution_stats['total_duration'] = (execution_stats['end_time'] - execution_stats['start_time']).total_seconds()
-    
-    # 顯示執行統計
-    print("\n" + "="*60)
-    print("📈 MySQL 5.7.27 Program Execution Statistics")
-    print("="*60)
-    print(f"⏰ 執行時間: {execution_stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')} - {execution_stats['end_time'].strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"🕒 總耗時: {execution_stats['total_duration']:.2f} 秒")
-    if execution_stats['import_files'] > 0:
-        print(f"📁 匯入統計: {execution_stats['import_success']}/{execution_stats['import_files']} 檔案成功")
-        print(f"📈 匯入成功率: {execution_stats['import_success']/execution_stats['import_files']*100:.1f}%")
-    if execution_stats['total_records_imported'] > 0:
-        print(f"📊 總匯入記錄: {execution_stats['total_records_imported']:,} 筆")
-        print(f"⚡ 匯入速度: {execution_stats['total_records_imported']/execution_stats['total_duration']:.0f} 筆/秒")
-    if execution_stats['analysis_queries'] > 0:
-        print(f"🔍 分析查詢: {execution_stats['analysis_queries']} 個 (耗時 {execution_stats['analysis_time']:.2f} 秒)")
-        if execution_stats['analysis_time'] > 0:
-            print(f"⚡ 查詢效率: {execution_stats['analysis_queries']/execution_stats['analysis_time']:.1f} 查詢/秒")
-    
-    # 錯誤和警告總結
-    if execution_stats['errors']:
-        print(f"\n❌ 錯誤總數: {len(execution_stats['errors'])}")
-        for i, error in enumerate(execution_stats['errors'][:3], 1):  # 只顯示前3個錯誤
-            print(f"   {i}. {error[:100]}{'...' if len(error) > 100 else ''}")
-        if len(execution_stats['errors']) > 3:
-            print(f"   ... 及其他 {len(execution_stats['errors']) - 3} 個錯誤")
-            
-    if execution_stats['warnings']:
-        print(f"\n⚠️  警告總數: {len(execution_stats['warnings'])}")
-        for i, warning in enumerate(execution_stats['warnings'][:3], 1):  # 只顯示前3個警告
-            print(f"   {i}. {warning}")
-        if len(execution_stats['warnings']) > 3:
-            print(f"   ... 及其他 {len(execution_stats['warnings']) - 3} 個警告")
-    
-    # 最終清理
+    # 關閉資料庫連線
     try:
-        close_connection_pool()
-    except Exception as e:
-        print(f"⚠️  連線池清理警告: {e}")
-    
-    # 根據執行結果返回適當的退出碼
-    if execution_stats['errors']:
-        print("\n⚠️  程式執行完成，但有錯誤發生")
-        sys.exit(1)
-    elif execution_stats['warnings']:
-        print("\n✅ 程式執行完成，但有警告")
-    else:
-        print("\n🎉 程式執行完成，無錯誤")
+        conn.close()
+        print("📴 資料庫連線已關閉")
+    except:
+        pass
 
 if __name__ == "__main__":
     main()
