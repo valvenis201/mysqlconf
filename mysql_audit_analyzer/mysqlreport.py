@@ -102,21 +102,8 @@ class MySQL57ConnectionPool:
                 connect_timeout=30,
                 read_timeout=600,
                 write_timeout=600,
-                # MySQL 5.7.27 優化參數
+                # MySQL 5.7.27 基本參數
                 sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO',
-                init_command="""
-                    SET SESSION tmp_table_size = 67108864;
-                    SET SESSION max_heap_table_size = 67108864;
-                    SET SESSION sort_buffer_size = 2097152;
-                    SET SESSION join_buffer_size = 2097152;
-                    SET SESSION read_buffer_size = 131072;
-                    SET SESSION read_rnd_buffer_size = 262144;
-                    SET SESSION big_tables = 1;
-                    SET SESSION innodb_lock_wait_timeout = 50;
-                    SET SESSION net_read_timeout = 600;
-                    SET SESSION net_write_timeout = 600;
-                    SET SESSION query_cache_type = OFF;
-                """,
                 **self.kwargs
             )
             self._stats['created'] += 1
@@ -533,20 +520,8 @@ def get_legacy_db_conn(config: Config):
         connect_timeout=30,
         read_timeout=config.db_query_timeout,
         write_timeout=config.db_query_timeout,
-        # MySQL 5.7.27 優化參數
-        sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO',
-        init_command="""
-            SET SESSION tmp_table_size = 67108864;
-            SET SESSION max_heap_table_size = 67108864;
-            SET SESSION sort_buffer_size = 2097152;
-            SET SESSION join_buffer_size = 2097152;
-            SET SESSION read_buffer_size = 131072;
-            SET SESSION read_rnd_buffer_size = 262144;
-            SET SESSION big_tables = 1;
-            SET SESSION innodb_lock_wait_timeout = 50;
-            SET SESSION net_read_timeout = 600;
-            SET SESSION net_write_timeout = 600;
-        """
+        # MySQL 5.7.27 基本參數
+        sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'
     )
     return connection
 
@@ -582,22 +557,8 @@ def get_simple_db_conn(config: Config):
         read_timeout=600,  # 分析查詢可能需要更長時間
         write_timeout=600,
         cursorclass=pymysql.cursors.DictCursor,  # 使用字典游標便於結果處理
-        # MySQL 5.7.27 分析查詢優化參數
-        sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO',
-        init_command="""
-            SET SESSION tmp_table_size = 134217728;
-            SET SESSION max_heap_table_size = 134217728;
-            SET SESSION sort_buffer_size = 4194304;
-            SET SESSION join_buffer_size = 4194304;
-            SET SESSION read_buffer_size = 262144;
-            SET SESSION read_rnd_buffer_size = 524288;
-            SET SESSION big_tables = 1;
-            SET SESSION optimizer_search_depth = 62;
-            SET SESSION query_cache_type = OFF;
-            SET SESSION innodb_lock_wait_timeout = 120;
-            SET SESSION net_read_timeout = 1200;
-            SET SESSION net_write_timeout = 1200;
-        """
+        # MySQL 5.7.27 基本參數
+        sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'
     )
     return connection
 
@@ -667,16 +628,8 @@ def execute_query_with_retry(conn, query, params=None, config=None, fetch_mode='
                             # MySQL 5.7.27 查詢優化參數設定
                     if config:
                         try:
-                            # 設定 MySQL 5.7.27 特定的優化參數
-                            optimization_sql = f"""
-                                SET SESSION innodb_lock_wait_timeout = {min(config.db_query_timeout, 120)};
-                                SET SESSION max_execution_time = {config.db_query_timeout * 1000};
-                                SET SESSION optimizer_search_depth = 62;
-                                SET SESSION eq_range_index_dive_limit = 200;
-                            """
-                            for sql in optimization_sql.strip().split(';'):
-                                if sql.strip():
-                                    cur.execute(sql.strip())
+                            # 不再自動設定 SQL 參數
+                            pass
                         except Exception as opt_error:
                             # 忽略優化參數設置失敗，但記錄警告
                             print(f"⚠️  MySQL 5.7.27 優化參數設置失敗: {opt_error}")
