@@ -290,6 +290,45 @@ def get_legacy_db_conn(config: Config):
         write_timeout=config.db_query_timeout
     )
 
+def get_simple_db_conn(config: Config):
+    """
+    取得簡單的資料庫連線用於分析 (不使用連接池)
+    """
+    return pymysql.connect(
+        host=config.mysql_host,
+        port=config.mysql_port,
+        user=config.mysql_user,
+        password=config.mysql_password,
+        database=config.mysql_db,
+        charset='utf8mb4',
+        autocommit=True,
+        connect_timeout=30,
+        read_timeout=600,  # 分析查詢可能需要更長時間
+        write_timeout=600,
+        cursorclass=pymysql.cursors.DictCursor  # 使用字典游標便於結果處理
+    )
+
+def execute_simple_query(conn, query, params=None):
+    """
+    執行簡單查詢用於分析 (不使用複雜的重試和資源監控)
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchall()
+    except Exception as e:
+        print(f"❌ 查詢執行失敗: {e}")
+        return []
+
+def execute_analysis_query(conn, query, params=None, use_simple=True):
+    """
+    執行分析查詢，可選擇簡單模式或複雜模式
+    """
+    if use_simple:
+        return execute_simple_query(conn, query, params)
+    else:
+        return execute_query_with_retry(conn, query, params, None, 'fetchall')
+
 def execute_query_with_retry(conn, query, params=None, config=None, fetch_mode='fetchall'):
     """
     執行查詢並加入重試機制、記憶體管理和資源監控
@@ -668,7 +707,7 @@ def get_log_file_for_date(config, date_str):
 
 # ========== 分析查詢（加入進度顯示） ==========
 
-def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config):
+def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config, use_simple=False):
     """
     執行所有分析功能並顯示進度
     """
@@ -690,9 +729,9 @@ def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filte
         
         try:
             if args:
-                results[name] = func(conn, date_filter, date_filter_value, *args, config=config)
+                results[name] = func(conn, date_filter, date_filter_value, *args, config=config, use_simple=use_simple)
             else:
-                results[name] = func(conn, date_filter, date_filter_value, config=config)
+                results[name] = func(conn, date_filter, date_filter_value, config=config, use_simple=use_simple)
             
             duration = (datetime.now() - start_time).total_seconds()
             
@@ -711,7 +750,7 @@ def run_analysis_with_progress(analysis_functions, conn, date_filter, date_filte
     
     return results
 
-def analyze_summary(conn, date_filter, date_filter_value, config=None):
+def analyze_summary(conn, date_filter, date_filter_value, config=None, use_simple=False):
     """基本統計分析 - 使用優化查詢"""
     if isinstance(date_filter_value, tuple):
         params = date_filter_value
@@ -730,7 +769,7 @@ def analyze_summary(conn, date_filter, date_filter_value, config=None):
         }
     return {'total_events': 0, 'unique_users': 0, 'unique_hosts': 0}
 
-def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5, config=None):
+def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5, config=None, use_simple=False):
     """失敗登入分析 - 使用優化查詢和結果限制"""
     if isinstance(date_filter_value, tuple):
         params = date_filter_value + (threshold,)
@@ -747,7 +786,7 @@ def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5, con
                 HAVING fail_count >= %s
                 ORDER BY fail_count DESC
                 LIMIT 1000"""
-    by_user = execute_query_with_retry(conn, query1, params, config, 'fetchall_safe')
+    by_user = execute_analysis_query(conn, query1, params, use_simple)
     
     # 查詢可疑IP (加入 LIMIT 限制)
     query2 = f"""SELECT host, COUNT(*) as fail_count
@@ -757,12 +796,15 @@ def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5, con
                 HAVING fail_count >= %s
                 ORDER BY fail_count DESC
                 LIMIT 1000"""
-    by_ip = execute_query_with_retry(conn, query2, params, config, 'fetchall_safe')
+    by_ip = execute_analysis_query(conn, query2, params, use_simple)
     
     # 總失敗次數
     query3 = f"SELECT COUNT(*) FROM audit_log WHERE operation='CONNECT' AND retcode!=0 AND {date_filter}"
-    total_result = execute_query_with_retry(conn, query3, params2, config, 'fetchone')
-    total = total_result[0] if total_result else 0
+    total_result = execute_analysis_query(conn, query3, params2, use_simple)
+    if total_result and len(total_result) > 0:
+        total = total_result[0]['COUNT(*)'] if use_simple else total_result[0][0]
+    else:
+        total = 0
     
     return {
         'total': total,
@@ -770,7 +812,7 @@ def analyze_failed_logins(conn, date_filter, date_filter_value, threshold=5, con
         'by_ip': by_ip or []
     }
 
-def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords, config=None):
+def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords, config=None, use_simple=False):
     """特權操作分析 - 使用優化查詢和結果限制"""
     like_clauses = " OR ".join(["UPPER(query) LIKE %s" for _ in keywords])
     like_params = [f"%{k.upper()}%" for k in keywords]
@@ -810,7 +852,7 @@ def analyze_privileged_operations(conn, date_filter, date_filter_value, keywords
         'details': details or []
     }
 
-def analyze_operation_stats(conn, date_filter, date_filter_value, config=None):
+def analyze_operation_stats(conn, date_filter, date_filter_value, config=None, use_simple=False):
     """操作類型統計分析 - 使用優化查詢"""
     if isinstance(date_filter_value, tuple):
         params = date_filter_value
@@ -827,7 +869,7 @@ def analyze_operation_stats(conn, date_filter, date_filter_value, config=None):
     result = execute_query_with_retry(conn, query, params, config, 'fetchall_safe')
     return result or []
 
-def analyze_error_codes(conn, date_filter, date_filter_value, config=None):
+def analyze_error_codes(conn, date_filter, date_filter_value, config=None, use_simple=False):
     """錯誤代碼分析 - 使用優化查詢"""
     if isinstance(date_filter_value, tuple):
         params = date_filter_value
@@ -853,7 +895,7 @@ def analyze_error_codes(conn, date_filter, date_filter_value, config=None):
         'error_codes': error_codes or []
     }
 
-def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_start, wh_end):
+def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_start, wh_end, config=None, use_simple=False):
     if not users:
         return {'total': 0, 'details': []}
     user_list = ','.join(["'%s'" % u for u in users])
@@ -880,7 +922,7 @@ def analyze_after_hours_access(conn, date_filter, date_filter_value, users, wh_s
                 after_hours.append((username, host, operation, dt.strftime('%Y-%m-%d %H:%M:%S')))
         return {'total': len(after_hours), 'details': after_hours[:50]}
 
-def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users):
+def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users, config=None, use_simple=False):
     if not users:
         return {'total': 0, 'by_user': [], 'details': []}
     user_list = ','.join(["'%s'" % u for u in users])
@@ -917,7 +959,7 @@ def analyze_privileged_user_logins(conn, date_filter, date_filter_value, users):
         total = cur.fetchone()[0]
         return {'total': total, 'by_user': by_user, 'details': details}
 
-def analyze_non_whitelisted_ips(conn, date_filter, date_filter_value, allowed_ips):
+def analyze_non_whitelisted_ips(conn, date_filter, date_filter_value, allowed_ips, config=None, use_simple=False):
     if not allowed_ips:
         return {'total': 0, 'by_ip': [], 'details': []}
     ip_list = ','.join(["'%s'" % ip for ip in allowed_ips])
@@ -1403,19 +1445,20 @@ def main():
         ("非白名單IP分析", analyze_non_whitelisted_ips, (config.allowed_ips,))
     ]
     
-    # 執行分析 (使用連線池)
+    # 執行分析 (使用簡單連線)
+    conn = None
     try:
-        with get_db_conn(config) as conn:
-            results = run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config)
+        print("🔗 建立資料庫連線...")
+        conn = get_simple_db_conn(config)
+        print("✅ 資料庫連線成功")
+        results = run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config, use_simple=True)
     except Exception as e:
-        print(f"❌ 分析過程發生錯誤，嘗試使用傳統連線: {e}")
-        try:
-            conn = get_legacy_db_conn(config)
-            results = run_analysis_with_progress(analysis_functions, conn, date_filter, date_filter_value, config)
+        print(f"❌ 分析過程發生錯誤: {e}")
+        return
+    finally:
+        if conn:
             conn.close()
-        except Exception as e2:
-            print(f"❌ 分析完全失敗: {e2}")
-            return
+            print("🔗 資料庫連線已關閉")
     
     # 解構結果
     summary = results.get("基本統計", {})
