@@ -330,8 +330,14 @@ def execute_query_with_retry(conn, query, params=None, config=None, fetch_mode='
                 with conn.cursor() as cur:
                     # 設定查詢超時和優化參數
                     if config:
-                        cur.execute(f"SET SESSION innodb_lock_wait_timeout = {min(config.db_query_timeout, 50)}")
-                        cur.execute(f"SET SESSION max_execution_time = {config.db_query_timeout * 1000}")
+                        try:
+                            cur.execute(f"SET SESSION innodb_lock_wait_timeout = {min(config.db_query_timeout, 50)}")
+                        except:
+                            pass  # 忽略 innodb_lock_wait_timeout 設置失敗
+                        try:
+                            cur.execute(f"SET SESSION max_execution_time = {config.db_query_timeout * 1000}")
+                        except:
+                            pass  # 忽略 max_execution_time 設置失敗
                     
                     cur.execute(query, params)
                     
