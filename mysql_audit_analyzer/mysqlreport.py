@@ -109,16 +109,6 @@ class SimpleConnectionPool:
                 # 池已滿，關閉連接
                 conn.close()
 
-def init_resource_monitoring(config: Config):
-    """初始化資源監控"""
-    global _resource_monitor, _query_semaphore
-    
-    if config.enable_resource_monitoring:
-        _resource_monitor = ResourceMonitor(config.max_memory_usage_mb)
-        print(f"✅ 資源監控初始化完成 (記憶體限制: {config.max_memory_usage_mb}MB)")
-    
-    _query_semaphore = threading.Semaphore(config.max_concurrent_queries)
-    print(f"✅ 查詢並行控制初始化完成 (最大並行: {config.max_concurrent_queries})")
 
 # 加入 tqdm 支援
 try:
@@ -224,6 +214,17 @@ class Config:
             "USE_LOAD_DATA_INFILE": self.use_load_data_infile,
             "TEMP_DIR": self.temp_dir,
         }
+
+def init_resource_monitoring(config: Config):
+    """初始化資源監控"""
+    global _resource_monitor, _query_semaphore
+    
+    if config.enable_resource_monitoring:
+        _resource_monitor = ResourceMonitor(config.max_memory_usage_mb)
+        print(f"✅ 資源監控初始化完成 (記憶體限制: {config.max_memory_usage_mb}MB)")
+    
+    _query_semaphore = threading.Semaphore(config.max_concurrent_queries)
+    print(f"✅ 查詢並行控制初始化完成 (最大並行: {config.max_concurrent_queries})")
 
 # 全域連線池變數
 _connection_pool = None
